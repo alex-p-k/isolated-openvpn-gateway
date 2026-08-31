@@ -1,0 +1,8 @@
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+RUN apk add --no-cache dante-server python3 iproute2 curl bind-tools \
+    && addgroup -g 10000 proxyuser && adduser -D -H -u 10000 -G proxyuser proxyuser
+COPY scripts/socks.py /opt/gateway/socks.py
+COPY scripts/sockd.conf /etc/sockd.conf
+RUN chmod 0444 /opt/gateway/socks.py /etc/sockd.conf
+USER 10000:10000
+ENTRYPOINT ["python3", "-u", "/opt/gateway/socks.py"]

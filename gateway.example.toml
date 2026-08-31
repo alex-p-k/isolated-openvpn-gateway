@@ -1,0 +1,24 @@
+[gateway]
+id = "example-company"
+display_name = "Example Company VPN"
+default_transport = "udp"
+dns_canary = "internal.example.com"
+socks_port = 1080
+require_outer_vpn = true
+outer_interface_prefix = "utun"
+
+[transports.udp]
+profile_file = "company-udp.ovpn"
+remote_host = "vpn.example.com"
+remote_port = 1194
+remote_protocol = "udp4"
+required_inline_blocks = ["ca", "tls-auth"]
+
+[transports.tcp]
+profile_file = "company-tcp.ovpn"
+remote_host = "vpn.example.com"
+remote_port = 443
+remote_protocol = "tcp-client"
+http_proxy_host = "192.0.2.80"
+http_proxy_port = 443
+required_inline_blocks = ["ca", "tls-auth"]

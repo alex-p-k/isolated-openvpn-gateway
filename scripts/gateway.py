@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""Host lifecycle. This program never starts OpenVPN on macOS."""
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+
+from gateway_config import (BROWSER_CLI, BROWSER_DIR, CLI, INSTALL_DIR, PROJECT,
+                            SOCKS_IMAGE, VPN_IMAGE, ConfigError, load_config)
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNTIME = ROOT / 'runtime'
+STATE = RUNTIME / 'state'
+AUTH = RUNTIME / 'auth'
+PREFS = ROOT / 'settings.json'
+DOCKER = next((str(p) for p in (
+    Path(shutil.which('docker') or '/usr/local/bin/docker'),
+    Path.home()/'.docker/bin/docker',
+    Path('/Applications/Docker.app/Contents/Resources/bin/docker'),
+    Path.home()/'Applications/Docker.app/Contents/Resources/bin/docker',
+) if p.is_file() and os.access(p,os.X_OK)), '/usr/local/bin/docker')
+CURL = '/usr/bin/curl'
+IP_URL = 'https://api.ipify.org'
+IMAGE = VPN_IMAGE
+ENV = {k:v for k,v in os.environ.items() if k not in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')}
+
+class GatewayError(Exception):
+    pass
+
+def configuration():
+    path = ROOT / 'gateway.toml'
+    if not path.is_file():
+        path = ROOT / 'gateway.example.toml'
+    try:
+        return load_config(path)
+    except ConfigError as exc:
+        raise GatewayError(str(exc)) from None
+
+def run(args, *, check=True, timeout=40, capture=True, env=None, **kwargs):
+    result = subprocess.run([str(x) for x in args], env=ENV if env is None else env,
+                            text=True, capture_output=capture, timeout=timeout, **kwargs)
+    if check and result.returncode:
+        # Commands never include credentials. Do not dump config/source files.
+        raise GatewayError((result.stderr or result.stdout or 'Command failed')[-1400:] if capture else 'Command failed')
+    return result
+
+def docker(*args, **kwargs):
+    return run([DOCKER, '--context', 'desktop-linux', *args], **kwargs)
+
+def compose(*args, **kwargs):
+    cfg = configuration()
+    env = dict(ENV, GATEWAY_SOCKS_PORT=str(cfg['socks_port']))
+    return run([DOCKER, '--context', 'desktop-linux', 'compose', '--project-name', PROJECT,
+                '--project-directory', ROOT, '-f', ROOT/'compose.yaml', *args], env=env, **kwargs)
+
+def private_write(path, text, mode=0o600):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise GatewayError('Refusing symlink: '+str(path))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    path.chmod(mode)
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+def preferences():
+    return read_json(PREFS, {'default_transport':'udp'})
+
+def save_preferences(data):
+    private_write(PREFS, json.dumps(data, indent=2)+'\n')
+
+def socks_available():
+    try:
+        cfg = configuration()
+        with socket.create_connection((cfg['socks_host'], cfg['socks_port']), timeout=2) as s:
+            s.sendall(b'\x05\x01\x00')
+            return s.recv(2) == b'\x05\x00'
+    except OSError:
+        return False
+
+def socks_dns_query(address):
+    """Verify a real TCP DNS exchange through SOCKS with a pushed DNS server.
+
+    Unlike a greeting, this proves that Dante can open and carry a connection
+    into the private network. It does not require public Internet access.
+    """
+    def receive(sock, length):
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                raise OSError('SOCKS stream closed')
+            data += chunk
+        return data
+    try:
+        destination = ipaddress.IPv4Address(address).packed
+        cfg = configuration()
+        with socket.create_connection((cfg['socks_host'], cfg['socks_port']), timeout=4) as sock:
+            sock.settimeout(5)
+            sock.sendall(b'\x05\x01\x00')
+            if receive(sock, 2) != b'\x05\x00':
+                return False
+            sock.sendall(b'\x05\x01\x00\x01' + destination + struct.pack('!H', 53))
+            header = receive(sock, 4)
+            if header[:3] != b'\x05\x00\x00':
+                return False
+            length = {1:4, 4:16}.get(header[3])
+            if header[3] == 3:
+                length = receive(sock, 1)[0]
+            if length is None:
+                return False
+            receive(sock, length + 2)
+            qname = b''.join(bytes([len(x)]) + x.encode('ascii')
+                             for x in cfg['dns_canary'].split('.')) + b'\x00'
+            transaction = 0x4356
+            query = struct.pack('!6H', transaction, 0x100, 1, 0, 0, 0) + qname + struct.pack('!2H', 1, 1)
+            sock.sendall(struct.pack('!H', len(query)) + query)
+            reply = receive(sock, struct.unpack('!H', receive(sock, 2))[0])
+            ident, flags, questions, answers, _, _ = struct.unpack('!6H', reply[:12])
+            return (ident == transaction and bool(flags & 0x8000) and flags & 15 == 0
+                    and questions == 1 and answers > 0 and len(reply) > 12)
+    except (OSError, ValueError, struct.error):
+        return False
+
+def public_ip(proxy=False):
+    cfg = configuration()
+    args = [CURL, '-4', '--noproxy', '' if proxy else '*', '--fail', '--silent', '--show-error',
+            '--connect-timeout', '6', '--max-time', '12']
+    if proxy:
+        args += ['--proxy', 'socks5h://%s:%d' % (cfg['socks_host'], cfg['socks_port'])]
+    result = run([*args, IP_URL], check=False, timeout=15)
+    try:
+        return str(ipaddress.ip_address(result.stdout.strip())) if result.returncode == 0 else None
+    except ValueError:
+        return None
+
+def network_snapshot():
+    commands = {'dns':['scutil','--dns'], 'routes':['netstat','-rn','-f','inet'],
+                'default':['route','-n','get','default'], 'public_route':['route','-n','get','1.1.1.1'],
+                'git_global_proxy':['git','config','--global','--get-regexp', r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$']}
+    data = {'captured_at': time.time(), 'public_ip':public_ip()}
+    for key, cmd in commands.items():
+        r = run(cmd, check=False)
+        data[key] = {'code':r.returncode, 'stdout':r.stdout, 'stderr':r.stderr}
+    data['static_routes'] = [' '.join(line.split()[:4]) for line in data['routes']['stdout'].splitlines()
+                             if len(line.split()) >= 4 and 'S' in line.split()[2]]
+    data['public_route_signature'] = '\n'.join(line.strip() for line in data['public_route']['stdout'].splitlines()
+                                               if re.match(r'\s*(destination|mask|gateway|interface):',line))
+    return data
+
+def compare_host(before, after):
+    return {'host_dns_preserved': before['dns'] == after['dns'],
+            'host_static_routes_preserved':before['static_routes'] == after['static_routes'],
+            'host_public_route_preserved':before['public_route_signature'] == after['public_route_signature'],
+            'host_outer_ip_preserved':bool(before['public_ip']) and before['public_ip'] == after['public_ip'],
+            'global_git_proxy_preserved':before['git_global_proxy'] == after['git_global_proxy']}
+
+def engine():
+    if docker('info','--format','{{.Name}}',check=False).returncode:
+        raise GatewayError('Docker Desktop Engine is stopped. Start Docker Desktop, then retry.')
+
+def images():
+    for image in (IMAGE, SOCKS_IMAGE):
+        if docker('image','inspect', image, check=False).returncode:
+            print('Building private gateway images (no configuration or credentials in build context).',flush=True)
+            compose('build', timeout=600, capture=False)
+            return
+
+def preflight():
+    engine(); images()
+    cfg = configuration()
+    before = network_snapshot()
+    prefix = re.escape(cfg['outer_interface_prefix'])
+    if cfg['require_outer_vpn'] and not re.search(r'interface:\s+' + prefix + r'\d+', before['public_route']['stdout']):
+        raise GatewayError('No active outer VPN route on ' + cfg['outer_interface_prefix'] +
+                           '*. Connect the required outer VPN before starting.')
+    result = docker('run','--rm','--cap-drop','ALL','--read-only','--security-opt','no-new-privileges',
+                    '--entrypoint','curl',IMAGE,'-4','--noproxy','*','-fsS','--max-time','15',IP_URL, timeout=25)
+    container_ip = result.stdout.strip()
+    if not before['public_ip'] or container_ip != before['public_ip']:
+        raise GatewayError('Outer path check failed: host/container egress differs or is unavailable. Inner VPN was not started.')
+    before['docker_public_ip'] = container_ip
+    private_write(ROOT/'validation'/'before.json', json.dumps(before,indent=2))
+    print('Outer VPN preflight passed: host = Docker = '+container_ip,flush=True)
+    return before
+
+def container_id(service):
+    return compose('ps','--all','--quiet',service,check=False).stdout.strip()
+
+def ready():
+    return bool(read_json(STATE/'status.json').get('ready')) and socks_available()
+
+def cleanup_auth():
+    # SSD/APFS cannot promise forensic secure erasure; permissions and short
+    # lifetime are the protection. No secret is intentionally backed up.
+    if AUTH.is_symlink() or AUTH.exists():
+        AUTH.unlink()
+
+def stop_internal(keep_auth=False):
+    result = compose('down','--timeout','8','--remove-orphans',check=False,timeout=35)
+    if not keep_auth:
+        cleanup_auth()
+    if result.returncode:
+        raise GatewayError('Docker could not remove gateway containers. Credentials were removed unless this is a controlled transport comparison.')
+
+def prompt_credentials():
+    cleanup_auth()
+    if not sys.stdin.isatty():
+        raise GatewayError('Credentials require an interactive terminal; run ' + CLI +
+                           ' start there. Do not send credentials in chat.')
+    print('VPN credentials: both inputs are hidden; nothing is saved in shell history.',flush=True)
+    username = getpass.getpass('VPN username: ')
+    password = getpass.getpass('VPN password: ')
+    if not username or not password or any(c in username+password for c in '\r\n\x00'):
+        raise GatewayError('Empty or multiline credentials are not supported.')
+    private_write(AUTH, username+'\n'+password+'\n')
+    del username, password
+
+def derive_config(source, expected=None):
+    """Only known profile directives are accepted; embedded keys are opaque data."""
+    allowed = {'dev','persist-tun','persist-key','data-ciphers','data-ciphers-fallback','ncp-ciphers',
+               'cipher','auth','tls-client','client','resolv-retry','remote','nobind','auth-user-pass',
+               'remote-cert-tls','explicit-exit-notify','setenv','key-direction','http-proxy',
+               'proto','remote-random','connect-retry','connect-timeout','verb','mute-replay-warnings',
+               'tls-version-min','tls-cipher','tls-ciphersuites','verify-x509-name','reneg-sec',
+               'auth-nocache','auth-retry','remote-cert-ku','remote-cert-eku','x509-username-field',
+               'fast-io','sndbuf','rcvbuf','mssfix','tun-mtu'}
+    allowed_blocks = {'ca','cert','key','tls-auth','tls-crypt','tls-crypt-v2'}
+    output, block, blocks, modern, cipher, remotes, proxies = [], None, {}, False, None, [], []
+    auth_user_pass = []
+    remote_cert_tls = False
+    auth_valid = False
+    for line in source.splitlines():
+        s = line.strip()
+        if block:
+            output.append(line)
+            if s == '</'+block+'>':
+                block = None
+            elif s:
+                blocks[block] += 1
+            continue
+        if s.startswith('<'):
+            name = s[1:-1] if s.endswith('>') and not s.startswith('</') else ''
+            if name not in allowed_blocks or name in blocks:
+                raise GatewayError('Unexpected or duplicate inline profile block.')
+            block = name; blocks[name] = 0; output.append(line); continue
+        if not s or s.startswith(('#',';')):
+            output.append(line); continue
+        try:
+            p = shlex.split(s)
+        except ValueError:
+            raise GatewayError('Malformed profile directive.') from None
+        key = p[0]
+        if key not in allowed:
+            raise GatewayError('Unexpected profile directive; manual review required: '+key)
+        if key == 'remote':
+            remotes.append(p)
+        if key == 'http-proxy':
+            proxies.append(p)
+        if key == 'auth-user-pass':
+            auth_user_pass.append(p)
+        if key == 'remote-cert-tls' and p == ['remote-cert-tls', 'server']:
+            remote_cert_tls = True
+        if key == 'auth' and len(p) == 2 and p[1].lower() != 'none':
+            auth_valid = True
+        if key in ('persist-tun','auth-user-pass','setenv'):
+            continue
+        if key == 'dev':
+            output.append('dev tun0'); continue
+        if key == 'ncp-ciphers':
+            # OpenVPN 2.6 alias normalized without broadening the cipher list.
+            output.append('data-ciphers '+' '.join(p[1:])); modern=True; continue
+        if key == 'cipher':
+            cipher = p[1]
+        if key == 'data-ciphers-fallback':
+            cipher = None
+        output.append(line)
+    if block or len(remotes) != 1 or auth_user_pass != [['auth-user-pass']] or not remote_cert_tls or not auth_valid:
+        raise GatewayError('Malformed profile or required authentication/TLS directives are absent.')
+    if expected:
+        expected_remote = ['remote', expected['remote_host'], str(expected['remote_port']),
+                           expected['remote_protocol']]
+        expected_proxy = ([['http-proxy', expected['http_proxy_host'], str(expected['http_proxy_port'])]]
+                          if expected['http_proxy_host'] else [])
+        if remotes != [expected_remote]:
+            raise GatewayError('Profile remote does not match gateway.toml.')
+        if proxies != expected_proxy:
+            raise GatewayError('Profile HTTP proxy does not match gateway.toml.')
+        if any(blocks.get(name, 0) == 0 for name in expected['required_inline_blocks']):
+            raise GatewayError('Profile is missing a required inline security block.')
+    if modern and cipher:
+        output.append('data-ciphers-fallback '+cipher)
+    # IPv4-only proxy; do not install unusable IPv6 tunnel routes.
+    output += ['pull-filter ignore "route-ipv6"', 'pull-filter ignore "ifconfig-ipv6"',
+               'pull-filter ignore "block-outside-dns"', 'pull-filter ignore "register-dns"']
+    return '\n'.join(output)+'\n'
+
+def prepare(transport):
+    cfg = configuration()
+    if transport not in cfg['transports']:
+        raise GatewayError('Unknown transport: ' + transport)
+    STATE.mkdir(mode=0o755,parents=True,exist_ok=True)
+    STATE.chmod(0o755)
+    for name in ('status.json','status.new','safe.log'):
+        p=STATE/name
+        if p.exists() or p.is_symlink():
+            p.unlink()
+    private_write(STATE/'resolv.conf','nameserver 127.0.0.1\noptions timeout:2 attempts:2\n',0o644)
+    profile = cfg['transports'][transport]
+    private_write(RUNTIME/'client.ovpn', derive_config(
+        (ROOT/'config'/profile['profile_file']).read_text(), profile))
+    private_write(RUNTIME/'selected-transport',transport+'\n')
+
+def start_transport(transport, timeout=100):
+    prepare(transport)
+    compose('up','-d','--no-build','vpn',timeout=40)
+    print('Waiting for '+transport.upper()+' OpenVPN initialization and tun0...',flush=True)
+    deadline = time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        data = read_json(STATE/'status.json')
+        if data.get('hook_error') or (data.get('initialization_completed') and not data.get('routes_ready')):
+            print('OpenVPN initialized, but gateway network hook failed: '+str(data.get('hook_error','route-up did not complete')),flush=True)
+            logs()
+            return False
+        if data.get('ready'):
+            cid=container_id('vpn')
+            if cid and docker('exec',cid,'python3','/opt/gateway/vpn.py','health',check=False).returncode == 0:
+                compose('up','-d','--no-build','socks',timeout=35)
+                for _ in range(20):
+                    if socks_available():
+                        print('Connected: Initialization Sequence Completed; tun0 verified; SOCKS5 handshake passed.',flush=True)
+                        return True
+                    time.sleep(0.5)
+                print('VPN initialized, but Dante did not become available.',flush=True)
+                return False
+        cid=container_id('vpn')
+        if cid and docker('inspect','--format','{{.State.Running}}',cid,check=False).stdout.strip() == 'false':
+            break
+        time.sleep(2)
+    print('Transport did not become ready. Sanitized events:',flush=True)
+    logs()
+    return False
+
+def logs():
+    path = STATE/'safe.log'
+    print('\n'.join(path.read_text().splitlines()[-45:]) if path.exists() else 'No sanitized VPN events yet.')
+
+def status():
+    engine()
+    data = read_json(STATE/'status.json')
+    transport = (RUNTIME/'selected-transport').read_text().strip() if (RUNTIME/'selected-transport').exists() else 'none'
+    print('Selected transport:',transport)
+    print(compose('ps','--all',check=False).stdout.strip())
+    cid=container_id('vpn')
+    if cid:
+        for args in (['ip','-4','addr','show','dev','tun0'],['ip','-4','route'],['ip','rule'],['ip','route','show','table','100']):
+            r=docker('exec',cid,*args,check=False)
+            if r.returncode == 0:
+                print(r.stdout.strip())
+    print('OpenVPN initialization completed:',bool(data.get('initialization_completed')))
+    print('Gateway ready:',bool(data.get('ready')))
+    if data.get('hook_error'):
+        print('Network hook error:',data['hook_error'])
+    print('Pushed DNS present:',bool(data.get('dns_pushed')))
+    print('SOCKS5 handshake:',socks_available())
+    if data.get('ready') and data.get('connected_at'):
+        print('Connected for: %d seconds' % (time.time()-data['connected_at']))
+
+def safe_target(value):
+    u=urlsplit(value if '://' in value else 'https://'+value)
+    if u.scheme not in ('http','https') or not u.hostname or u.username or u.password or u.query or u.fragment:
+        raise GatewayError('Supply a private http(s) URL without credentials, query or fragment.')
+    return u
+
+def validation(target=None):
+    before=read_json(ROOT/'validation'/'before.json')
+    after=network_snapshot()
+    result=compare_host(before,after) if before else {}
+    result['initialization_completed']=bool(read_json(STATE/'status.json').get('ready'))
+    result['socks_handshake']=socks_available()
+    cid=container_id('vpn')
+    if cid:
+        details=json.loads(docker('inspect',cid).stdout)[0]
+        cfg = configuration()
+        bindings=details['HostConfig']['PortBindings'].get('1080/tcp',[])
+        result['loopback_publish_only']=bindings == [
+            {'HostIp':cfg['socks_host'],'HostPort':str(cfg['socks_port'])}]
+        r=docker('exec',cid,'ip','route','get','1.1.1.1','uid','10000',check=False)
+        result['proxy_route_tun0']='dev tun0' in r.stdout
+        result['tun0_exists']=docker('exec',cid,'ip','link','show','tun0',check=False).returncode == 0
+        # Try forcing UID 10000 to eth0, even while the tunnel is up. This must
+        # fail; only UID 0 can send the exact outer OpenVPN endpoint traffic.
+        r=docker('exec','--user','10000:10000',cid,'curl','--interface','eth0','--noproxy','*',
+                 '-fsS','--connect-timeout','3','--max-time','4','http://1.1.1.1/',check=False,timeout=8)
+        result['forced_eth0_blocked']=r.returncode != 0
+    state=read_json(STATE/'status.json')
+    result['private_dns_pushed']=bool(state.get('dns_pushed'))
+    if state.get('dns'):
+        result['private_dns_via_socks']=any(socks_dns_query(address) for address in state['dns'])
+    if target:
+        u=safe_target(target)
+        cfg = configuration()
+        r=run([CURL,'--proxy','socks5h://%s:%d' % (cfg['socks_host'], cfg['socks_port']),
+               '--noproxy','','--connect-timeout','8','--max-time','20',
+               '--silent','--show-error','--output','/dev/null','--write-out','%{http_code}',u.geturl()],check=False,timeout=25)
+        result['private_http_status']=r.stdout
+        result['private_target_connected']=r.returncode == 0
+    else:
+        result['private_target_connected']='NOT TESTED: no private hostname supplied'
+    critical = ('host_dns_preserved','host_static_routes_preserved','host_public_route_preserved',
+                'host_outer_ip_preserved','global_git_proxy_preserved','initialization_completed',
+                'socks_handshake','loopback_publish_only','proxy_route_tun0','tun0_exists','forced_eth0_blocked')
+    result['passed'] = all(result.get(key) is True for key in critical)
+    if state.get('dns'):
+        result['passed'] = result['passed'] and result['private_dns_via_socks']
+    if target:
+        result['passed'] = result['passed'] and result.get('private_target_connected') is True
+    result['private_application_tested'] = bool(target)
+    private_write(ROOT/'validation'/'after.json',json.dumps(after,indent=2))
+    private_write(ROOT/'validation'/'latest.json',json.dumps(result,indent=2))
+    print(json.dumps(result,indent=2))
+    return result
+
+def failure_test():
+    cid=container_id('vpn')
+    if not cid or not ready():
+        raise GatewayError('Failure test needs a live verified connection first.')
+    dns=read_json(STATE/'status.json').get('dns',[])
+    if dns:
+        server=next((address for address in dns if socks_dns_query(address)),None)
+        if not server:
+            raise GatewayError('Failure test aborted: no successful private DNS request through SOCKS before stopping VPN.')
+        canary=lambda: socks_dns_query(server)
+    else:
+        canary=lambda: public_ip(proxy=True) is not None
+        if not canary():
+            raise GatewayError('Failure test aborted: a successful SOCKS request is required as a positive control.')
+    docker('exec',cid,'python3','-c',"import os,signal,pathlib; os.kill(int(pathlib.Path('/run/openvpn.pid').read_text()),signal.SIGTERM)")
+    time.sleep(3)
+    blocked=not canary()
+    outer=public_ip()
+    stopped=docker('inspect','--format','{{.State.Running}}',cid,check=False).stdout.strip() == 'false'
+    socks=container_id('socks')
+    tun_absent=bool(socks) and docker('exec',socks,'ip','link','show','tun0',check=False).returncode != 0
+    result={'openvpn_terminated':stopped,'tun0_absent':tun_absent,
+            'proxy_request_verified_before_stop':True,
+            'socks_after_vpn_stop_blocked':blocked,'host_still_online':bool(outer)}
+    print(json.dumps(result,indent=2),flush=True)
+    return result
+
+def compare_transports():
+    stop_internal()
+    before=preflight()
+    prompt_credentials()
+    results={}
+    selected=None
+    try:
+        transports = list(configuration()['transports'])
+        for transport in transports:
+            ok=start_transport(transport)
+            row={'connected':ok, 'openvpn_initialized':bool(read_json(STATE/'status.json').get('initialization_completed')),
+                 'gateway_state':read_json(STATE/'status.json')}
+            if ok:
+                row['validation']=validation(preferences().get('test_url'))
+                row['failure_test']=failure_test()
+            row['usable'] = ok and row.get('validation',{}).get('passed',False) and all(row.get('failure_test',{}).values())
+            row['events']=(STATE/'safe.log').read_text() if (STATE/'safe.log').exists() else ''
+            results[transport]=row
+            private_write(ROOT/'validation'/'transports.json',json.dumps(results,indent=2))
+            stop_internal(keep_auth=True)
+        selected=next((x for x in transports if results[x]['usable']),None)
+        if selected:
+            if not start_transport(selected):
+                selected=None
+                raise GatewayError('Chosen transport failed its repeat connection test.')
+            prefs=preferences(); prefs['default_transport']=selected; save_preferences(prefs)
+            validation(prefs.get('test_url'))
+            print('Selected default: '+selected+'; the other profile remains available.',flush=True)
+        else:
+            raise GatewayError('Neither transport passed all gateway checks; sanitized transport evidence saved.')
+    finally:
+        if not selected or not ready():
+            stop_internal()
+
+def repository_ssh_config(host, user_config='~/.ssh/config', system_config='/etc/ssh/ssh_config',
+                          proxy_host=None, proxy_port=None):
+    # Reset Host scope before Include. Otherwise unrelated hosts would lose
+    # the user's existing settings. Disable reuse of a possible direct master.
+    cfg = configuration()
+    proxy_host = proxy_host or cfg['socks_host']
+    proxy_port = proxy_port or cfg['socks_port']
+    return ('Host '+host+'\n'
+            '    ProxyCommand /usr/bin/nc -X 5 -x '+proxy_host+':'+str(proxy_port)+' %h %p\n'
+            '    CanonicalizeHostname no\n'
+            '    ControlMaster no\n'
+            '    ControlPath none\n'
+            '    ControlPersist no\n\n'
+            'Host *\n    Include '+json.dumps(str(user_config),ensure_ascii=False)+'\n'
+            'Host *\n    Include '+json.dumps(str(system_config),ensure_ascii=False)+'\n')
+
+def configure_git(repo):
+    repo=Path(repo).expanduser().resolve()
+    remotes=run(['git','-C',repo,'remote']).stdout.strip()
+    if not remotes:
+        raise GatewayError('Repository has no remotes. No Git settings changed.')
+    print('Repository remotes:', ', '.join(remotes.splitlines()))
+    remote=input('Private remote NAME to configure (e.g. origin): ').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+',remote):
+        raise GatewayError('Invalid remote name')
+    fetch_urls=run(['git','-C',repo,'remote','get-url','--all',remote]).stdout.splitlines()
+    push_urls=run(['git','-C',repo,'remote','get-url','--push','--all',remote]).stdout.splitlines()
+    if len(fetch_urls) != 1 or push_urls != fetch_urls:
+        raise GatewayError('Separate/multiple fetch or push URLs need manual scoped review; nothing changed.')
+    url=fetch_urls[0]
+    u=urlsplit(url)
+    config, config_text = None, None
+    if u.scheme == 'https':
+        safe_target(url)
+        cfg = configuration()
+        key='http.'+url+'.proxy'; value='socks5h://%s:%d' % (cfg['socks_host'],cfg['socks_port'])
+    else:
+        host=u.hostname if u.scheme == 'ssh' else (re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url).group(1)
+                if re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url) else None)
+        if not host or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*',host) or u.password:
+            raise GatewayError('Unsupported remote URL')
+        if os.environ.get('GIT_SSH_COMMAND') or os.environ.get('GIT_SSH'):
+            raise GatewayError('An environment SSH override exists; review it before configuring the proxy.')
+        key='core.sshCommand'
+        config=ROOT/'config'/('ssh-repo-'+hashlib.sha256(str(repo).encode()).hexdigest()[:16]+'.conf')
+        if os.path.lexists(config):
+            raise GatewayError('A private SSH configuration already exists; refusing to overwrite it.')
+        value='/usr/bin/ssh -F '+shlex.quote(str(config))
+        config_text=repository_ssh_config(host)
+    scope=['--local'] if key != 'core.sshCommand' else []
+    previous=run(['git','-C',repo,'config',*scope,'--get-all',key],check=False)
+    if previous.returncode == 0:
+        raise GatewayError('Existing proxy/SSH setting found. Review it manually; nothing overwritten.')
+    git_config=Path(run(['git','-C',repo,'rev-parse','--path-format=absolute','--git-path','config']).stdout.strip())
+    backup=ROOT/'backups'/('git-config-'+str(time.time_ns())+'.backup')
+    private_write(backup,git_config.read_text())
+    if config:
+        private_write(config,config_text)
+    run(['git','-C',repo,'config','--local',key,value])
+    records=read_json(ROOT/'git-changes.json',[])
+    records.append({'repo':str(repo),'key':key,'value':value,'backup':str(backup)})
+    private_write(ROOT/'git-changes.json',json.dumps(records,indent=2))
+    print('Configured repository only. Read-only test: '+shlex.join(['git','-C',str(repo),'ls-remote',remote]))
+
+def uninstall():
+    if input('Remove only '+PROJECT+' and its launchers? Type REMOVE: ') != 'REMOVE':
+        return
+    expected_root = Path.home()/INSTALL_DIR
+    marker = read_json(ROOT/'installation.json')
+    if marker.get('project') != PROJECT or ROOT != expected_root:
+        raise GatewayError('Installation ownership check failed; refusing to change anything.')
+    stop_internal()
+    for record in read_json(ROOT/'git-changes.json',[]):
+        r=run(['git','-C',record['repo'],'config','--local','--get',record['key']],check=False)
+        if r.stdout.strip() == record['value']:
+            run(['git','-C',record['repo'],'config','--local','--unset-all',record['key']])
+        elif r.returncode == 0:
+            raise GatewayError('Repository configuration changed since installation; preserve gateway and review rollback manually.')
+    for image in (IMAGE,SOCKS_IMAGE):
+        docker('image','rm',image,check=False)
+    profile=Path.home()/BROWSER_DIR
+    delete_profile=profile.exists() and input('Also delete the separate private browser profile? Type DELETE PROFILE: ') == 'DELETE PROFILE'
+    names = [CLI, BROWSER_CLI]
+    if marker.get('legacy_aliases'):
+        names += ['corp-vpn','corp-browser']
+    for name in names:
+        p=Path.home()/'.local/bin'/name
+        if p.is_symlink() and p.resolve().is_relative_to(ROOT):
+            p.unlink()
+    marker=read_json(ROOT/'installation.json')
+    if marker.get('project') != PROJECT or ROOT != expected_root:
+        raise GatewayError('Installation ownership check failed; refusing deletion.')
+    if delete_profile:
+        if not (profile/'.isolated-openvpn-gateway-owned').is_file():
+            raise GatewayError('Browser profile ownership marker is absent; refusing deletion.')
+        shutil.rmtree(profile)
+    shutil.rmtree(ROOT)
+    print('Gateway removed. Docker Desktop, outer VPN, repositories and global network/Git settings were preserved.')
+
+def usage():
+    try:
+        names = '|'.join(configuration()['transports'])
+    except GatewayError:
+        names = 'TRANSPORT'
+    print(CLI+' start ['+names+'] | stop | restart ['+names+'] | status | logs | test [URL]\n'
+          '            compare-transports | git-configure [repo] | build | uninstall')
+
+def main():
+    os.umask(0o077)
+    action=sys.argv[1] if len(sys.argv)>1 else 'status'
+    if action in ('--help','-h','help'):
+        usage()
+        return 0
+    if read_json(ROOT/'installation.json').get('project') != PROJECT or ROOT != Path.home()/INSTALL_DIR:
+        raise GatewayError('Run install.py first, then use ~/.local/bin/'+CLI+
+                           '; do not run lifecycle commands from the source archive.')
+    RUNTIME.mkdir(mode=0o700,exist_ok=True)
+    with (ROOT/'.lock').open('w') as lock:
+        if action not in ('status','logs','test'):
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise GatewayError('Another lifecycle command is still running.')
+        if action in ('start','restart'):
+            cfg = configuration()
+            selected=sys.argv[2] if len(sys.argv)>2 else preferences().get('default_transport',cfg['default_transport'])
+            if selected not in cfg['transports']:
+                raise GatewayError('Usage: '+CLI+' start ['+'|'.join(cfg['transports'])+']')
+            if action == 'start' and ready():
+                print('Already connected. Use '+CLI+' restart to switch sessions.'); status(); return
+            stop_internal(); preflight(); prompt_credentials()
+            try:
+                if not start_transport(selected):
+                    raise GatewayError('VPN not ready. See '+CLI+' logs; try another configured transport.')
+            finally:
+                if not ready():
+                    stop_internal()
+        elif action == 'stop':
+            stop_internal()
+            for name in ('client.ovpn','selected-transport'):
+                (RUNTIME/name).unlink(missing_ok=True)
+            print('Gateway stopped; ephemeral credentials removed.')
+        elif action == 'status': status()
+        elif action == 'logs': logs()
+        elif action == 'test':
+            return 0 if validation(sys.argv[2] if len(sys.argv)>2 else preferences().get('test_url')).get('passed') else 1
+        elif action == 'compare-transports': compare_transports()
+        elif action == 'git-configure': configure_git(sys.argv[2] if len(sys.argv)>2 else os.getcwd())
+        elif action == 'build': engine(); compose('build',capture=False,timeout=600)
+        elif action == 'uninstall': uninstall()
+        else:
+            usage()
+            return 2
+    return 0
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        if len(sys.argv)>1 and sys.argv[1] in ('start','restart','compare-transports'):
+            with contextlib.suppress(Exception):
+                stop_internal()
+            print('\nCancelled; credentials removed.',file=sys.stderr)
+        else:
+            print('\nCancelled.',file=sys.stderr)
+        sys.exit(130)
+    except (GatewayError, subprocess.TimeoutExpired) as exc:
+        print('ERROR:',str(exc),file=sys.stderr)
+        sys.exit(1)

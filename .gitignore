@@ -1,0 +1,16 @@
+/config/
+/runtime/
+/validation/
+/backups/
+/bin/
+/dist/
+/installation.json
+/settings.json
+/git-changes.json
+/gateway.toml
+*.ovpn
+*.key
+*.pem
+*.log
+__pycache__/
+.DS_Store

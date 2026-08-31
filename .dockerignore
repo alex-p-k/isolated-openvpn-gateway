@@ -1,0 +1,7 @@
+**
+!Dockerfile.vpn
+!Dockerfile.socks
+!scripts/
+!scripts/vpn.py
+!scripts/socks.py
+!scripts/sockd.conf

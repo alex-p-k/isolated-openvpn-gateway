@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Install the generic isolated OpenVPN-to-SOCKS5 gateway on macOS."""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+
+PACKAGE = Path(__file__).resolve().parent
+PACKAGE_FILES = (
+    'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'MIGRATION.md', 'install.py',
+    'gateway.example.toml', 'compose.yaml', 'Dockerfile.vpn', 'Dockerfile.socks',
+    '.dockerignore', '.gitignore', 'scripts/gateway_config.py', 'scripts/gateway.py',
+    'scripts/vpn.py', 'scripts/socks.py', 'scripts/sockd.conf', 'scripts/browser.py',
+    'tests/test_gateway.py', 'tests/test_install.py', 'tools/build_release.py',
+)
+INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
+    'install.py', 'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',
+))
+
+
+class InstallError(Exception):
+    pass
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe_source(package, name):
+    if name not in PACKAGE_FILES:
+        raise InstallError('File is not in the package allowlist.')
+    package = Path(package).resolve()
+    path = package / name
+    current = path
+    while current != package:
+        if current.is_symlink():
+            raise InstallError('Package contains a symlink: ' + name)
+        current = current.parent
+    if not path.is_file():
+        raise InstallError('Package file missing: ' + name)
+    return path
+
+
+def verify_manifest(package):
+    try:
+        lines = (package / 'MANIFEST.sha256').read_text().splitlines()
+        entries = [line.split('  ', 1) for line in lines if line]
+        if any(len(row) != 2 for row in entries):
+            raise ValueError
+        expected = {name: value for value, name in entries}
+    except (OSError, ValueError):
+        raise InstallError('Missing or malformed MANIFEST.sha256; obtain a complete release.') from None
+    if len(entries) != len(PACKAGE_FILES) or set(expected) != set(PACKAGE_FILES):
+        raise InstallError('Manifest does not match the release allowlist.')
+    for name in PACKAGE_FILES:
+        if digest(safe_source(package, name).read_bytes()) != expected[name]:
+            raise InstallError('Package checksum failed: ' + name)
+
+
+def source_module(package, name, relative):
+    script_dir = str(package / 'scripts')
+    added = script_dir not in sys.path
+    if added:
+        sys.path.insert(0, script_dir)
+    try:
+        spec = importlib.util.spec_from_file_location(name, package / relative)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if added:
+            sys.path.remove(script_dir)
+
+
+def gateway_module(package):
+    return source_module(package, 'handoff_gateway', 'scripts/gateway.py')
+
+
+def config_module(package):
+    return source_module(package, 'handoff_gateway_config', 'scripts/gateway_config.py')
+
+
+def load_profiles(paths, gateway, configuration):
+    """Validate profile data without executing directives or printing private content."""
+    result = {}
+    for transport, expected in configuration['transports'].items():
+        try:
+            path = Path(paths[transport]).expanduser().resolve(strict=True)
+            if not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise ValueError
+            data = path.read_bytes()
+            text = data.decode('utf-8')
+            gateway.derive_config(text, expected)
+            result[transport] = data
+        except (OSError, UnicodeError, ValueError, KeyError, gateway.GatewayError):
+            raise InstallError(transport + ' profile is missing or incompatible with gateway.toml. '
+                               'Use the matching IT-issued profile; no contents were printed or changed.') from None
+    return result
+
+
+def requirements(gateway):
+    import platform
+    if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'x86_64'):
+        raise InstallError('This installer targets macOS arm64/x86_64 only.')
+    if sys.version_info < (3, 11):
+        raise InstallError('Python 3.11 or newer is required. No Python installation was attempted.')
+    if not Path(gateway.DOCKER).is_file():
+        raise InstallError('Docker Desktop CLI not found; install/start Docker Desktop first.')
+    checks = [
+        ('Docker Engine', [gateway.DOCKER, '--context', 'desktop-linux', 'info', '--format', '{{.ServerVersion}}']),
+        ('Compose', [gateway.DOCKER, '--context', 'desktop-linux', 'compose', 'version', '--short']),
+        ('Git', ['git', '--version']),
+    ]
+    for name, args in checks:
+        try:
+            value = subprocess.run(args, env=gateway.ENV, capture_output=True, text=True, timeout=12)
+        except (OSError, subprocess.TimeoutExpired):
+            raise InstallError(name + ' is unavailable; install/start it and retry.') from None
+        if value.returncode:
+            raise InstallError(name + ' is unavailable; no system settings were changed.')
+        print(name + ': available')
+    print('macOS architecture: ' + platform.machine() + '; Python: ' + platform.python_version())
+    browser_paths = (
+        Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+        Path('/Applications/Chromium.app/Contents/MacOS/Chromium'),
+        Path.home() / 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        Path.home() / 'Applications/Chromium.app/Contents/MacOS/Chromium',
+    )
+    print('Browser: available' if any(p.is_file() for p in browser_paths)
+          else 'Browser: install Chrome/Chromium before using vpn-browser (Git does not require it).')
+
+
+def write_private(path, data, mode=0o600):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+    path.chmod(mode)
+
+
+def install_files(package, target_home, profiles, python_executable, config_bytes, configuration,
+                  legacy_aliases=False):
+    """Install files only; do not run Docker, OpenVPN or any host network command."""
+    configlib = config_module(package)
+    root = target_home / configlib.INSTALL_DIR
+    launch_dir = target_home / '.local/bin'
+    commands = [configlib.CLI, configlib.BROWSER_CLI]
+    if legacy_aliases:
+        commands += ['corp-vpn', 'corp-browser']
+    links = [launch_dir / name for name in commands]
+    for path in (root, *links):
+        if os.path.lexists(path):
+            raise InstallError('Refusing to overwrite an existing installation or command: ' + str(path))
+    for parent in (root.parent, launch_dir):
+        for candidate in (parent, *parent.parents):
+            if candidate == target_home.parent:
+                break
+            if candidate.is_symlink():
+                raise InstallError('Refusing a symlink in the installation path: ' + str(candidate))
+    root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.mkdir(mode=0o700)
+    created_links = []
+    try:
+        for name in INSTALL_FILES:
+            write_private(root / name, safe_source(package, name).read_bytes())
+        for name in ('config', 'runtime', 'backups', 'validation', 'bin'):
+            (root / name).mkdir(mode=0o700, exist_ok=True)
+        write_private(root / 'gateway.toml', config_bytes)
+        for transport, data in profiles.items():
+            write_private(root / 'config' / configuration['transports'][transport]['profile_file'], data)
+        write_private(root / 'settings.json', (json.dumps({
+            'default_transport': configuration['default_transport']}, indent=2) + '\n').encode())
+        metadata = {
+            'project': configlib.PROJECT,
+            'deployment_id': configuration['id'],
+            'installed_at': time.time(),
+            'kit_version': (package / 'VERSION').read_text().strip(),
+            'source_hashes': {
+                configuration['transports'][kind]['profile_file']: digest(value)
+                for kind, value in profiles.items()
+            },
+            'legacy_aliases': bool(legacy_aliases),
+        }
+        write_private(root / 'installation.json', (json.dumps(metadata, indent=2) + '\n').encode())
+        for name, script in ((configlib.CLI, 'gateway.py'), (configlib.BROWSER_CLI, 'browser.py')):
+            launcher = '#!/bin/sh\nexec ' + shlex.quote(str(python_executable)) + ' ' + \
+                       shlex.quote(str(root / 'scripts' / script)) + ' "$@"\n'
+            write_private(root / 'bin' / name, launcher.encode(), 0o700)
+        if legacy_aliases:
+            for alias, target in (('corp-vpn', configlib.CLI), ('corp-browser', configlib.BROWSER_CLI)):
+                (root / 'bin' / alias).symlink_to(root / 'bin' / target)
+        launch_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for link in links:
+            link.symlink_to(root / 'bin' / link.name)
+            created_links.append(link)
+    except BaseException:
+        for link in created_links:
+            if link.is_symlink() and link.resolve().is_relative_to(root):
+                link.unlink()
+        shutil.rmtree(root)
+        raise
+    return root
+
+
+def profile_arguments(values, configuration):
+    result = {}
+    for value in values:
+        if '=' not in value:
+            raise InstallError('--profile must use TRANSPORT=/path/to/profile.ovpn.')
+        name, path = value.split('=', 1)
+        if name not in configuration['transports'] or name in result or not path:
+            raise InstallError('Unknown or duplicate --profile transport: ' + name)
+        result[name] = Path(path)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='read-only environment/profile checks; no installation')
+    parser.add_argument('--config', type=Path, help='private deployment gateway.toml')
+    parser.add_argument('--profiles-dir', type=Path, help='directory containing profile_file names from gateway.toml')
+    parser.add_argument('--profile', action='append', default=[], metavar='NAME=PATH',
+                        help='profile path for one configured transport; repeat for every transport')
+    parser.add_argument('--legacy-aliases', action='store_true',
+                        help='also create corp-vpn/corp-browser aliases if those names are unused')
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    sys.dont_write_bytecode = True
+    if os.geteuid() == 0:
+        raise InstallError('Run as your normal macOS user, not sudo/root.')
+    verify_manifest(PACKAGE)
+    gateway = gateway_module(PACKAGE)
+    configlib = config_module(PACKAGE)
+    configuration = None
+    config_bytes = None
+    if args.config:
+        try:
+            config_path = args.config.expanduser().resolve(strict=True)
+            config_bytes = config_path.read_bytes()
+            configuration = configlib.load_config(config_path)
+        except configlib.ConfigError as exc:
+            raise InstallError(str(exc)) from None
+    if args.profiles_dir and args.profile:
+        raise InstallError('Use either --profiles-dir or repeated --profile options.')
+    if (args.profiles_dir or args.profile) and not configuration:
+        raise InstallError('--config is required when profiles are supplied.')
+    paths = {}
+    if configuration and args.profiles_dir:
+        directory = args.profiles_dir.expanduser()
+        paths = {name: directory / item['profile_file'] for name, item in configuration['transports'].items()}
+    elif configuration and args.profile:
+        paths = profile_arguments(args.profile, configuration)
+    if paths and set(paths) != set(configuration['transports']):
+        missing = sorted(set(configuration['transports']) - set(paths))
+        raise InstallError('Profiles are required for every transport; missing: ' + ', '.join(missing))
+    profiles = load_profiles(paths, gateway, configuration) if paths else None
+    requirements(gateway)
+    if profiles:
+        print('Profiles: structurally compatible with gateway.toml; originals unchanged.')
+    if args.check:
+        print('Read-only checks complete. Outer-VPN inheritance and private access require the first start/test.')
+        return 0
+    if not configuration or not profiles:
+        raise InstallError('Supply --config and either --profiles-dir or one --profile per transport.')
+    root = install_files(PACKAGE, Path.home(), profiles, Path(sys.executable).resolve(),
+                         config_bytes, configuration, args.legacy_aliases)
+    print('Installed: ' + str(root))
+    print('No VPN was started; host DNS/routes, global Git and browser profiles were not changed.')
+    print('Next: enable your outer VPN, then run ~/.local/bin/vpn-gateway start')
+    print('If commands are not in PATH, run: export PATH="$HOME/.local/bin:$PATH"')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (InstallError, OSError) as exc:
+        print('ERROR: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

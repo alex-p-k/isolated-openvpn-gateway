@@ -1,0 +1,60 @@
+services:
+  vpn:
+    image: ${GATEWAY_VPN_IMAGE:-isolated-openvpn-gateway-vpn:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.vpn
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: "no"
+    ports: ["127.0.0.1:${GATEWAY_SOCKS_PORT:-1080}:1080/tcp"]
+    volumes:
+      - ./runtime/client.ovpn:/config/client.ovpn:ro
+      - ./runtime/auth:/run/credentials/auth:ro
+      - ./runtime/state:/state
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+      - /run:mode=0755,size=4m
+    mem_limit: 160m
+    cpus: 0.50
+    pids_limit: 48
+    ulimits:
+      core: 0
+    logging:
+      driver: none
+    healthcheck:
+      test: [CMD, python3, /opt/gateway/vpn.py, health]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+      start_period: 10s
+  socks:
+    image: ${GATEWAY_SOCKS_IMAGE:-isolated-openvpn-gateway-socks:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.socks
+    network_mode: service:vpn
+    depends_on:
+      vpn:
+        condition: service_healthy
+    user: "10000:10000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: "no"
+    volumes:
+      - ./runtime/state:/state:ro
+      - ./runtime/state/resolv.conf:/etc/resolv.conf:ro
+    tmpfs:
+      - /tmp:mode=1777,size=8m
+      - /run:mode=1777,size=2m
+    mem_limit: 96m
+    cpus: 0.50
+    pids_limit: 64
+    ulimits:
+      core: 0
+    logging:
+      driver: none
