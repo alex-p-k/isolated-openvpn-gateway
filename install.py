@@ -15,12 +15,15 @@ import time
 
 PACKAGE = Path(__file__).resolve().parent
 PACKAGE_FILES = (
-    'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'MIGRATION.md', 'WINDOWS.md', 'install.py',
+    'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'ROLLBACK.md', 'MIGRATION.md', 'WINDOWS.md', 'install.py',
     'gateway.example.toml', 'compose.yaml', 'Dockerfile.vpn', 'Dockerfile.socks',
     '.dockerignore', '.gitignore', 'scripts/gateway_config.py', 'scripts/host.py',
     'scripts/gateway.py', 'scripts/vpn.py', 'scripts/socks.py', 'scripts/sockd.conf',
-    'scripts/browser.py', 'scripts/socks_connect.py', 'tests/test_gateway.py',
+    'scripts/browser.py', 'scripts/socks_connect.py', 'scripts/wsl_backend.py',
+    'scripts/wsl_manager.py', 'scripts/wsl_bridge.py', 'scripts/loopback_forwarder.py',
+    'scripts/wsl_sockd.conf', 'tests/test_gateway.py', 'tests/test_wsl.py',
     'tests/test_install.py', 'tests/test_windows.py', 'tools/build_release.py',
+    'tools/windows_acceptance.ps1',
 )
 INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
     'install.py', 'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',
@@ -112,7 +115,7 @@ def load_profiles(paths, gateway, configuration):
     return result
 
 
-def requirements(gateway, hostlib):
+def requirements(gateway, hostlib, backend='docker'):
     import platform
     system = platform.system()
     architectures = {'Darwin': ('arm64', 'x86_64'), 'Windows': ('AMD64', 'ARM64', 'x86_64')}
@@ -120,13 +123,20 @@ def requirements(gateway, hostlib):
         raise InstallError('This installer targets macOS arm64/x86_64 and Windows AMD64/ARM64 only.')
     if sys.version_info < (3, 11):
         raise InstallError('Python 3.11 or newer is required. No Python installation was attempted.')
-    if not Path(gateway.DOCKER).is_file():
-        raise InstallError('Docker Desktop CLI not found; install/start Docker Desktop first.')
-    checks = [
-        ('Docker Engine', [gateway.DOCKER, '--context', 'desktop-linux', 'info', '--format', '{{.ServerVersion}}']),
-        ('Compose', [gateway.DOCKER, '--context', 'desktop-linux', 'compose', 'version', '--short']),
-        ('Git', ['git', '--version']),
-    ]
+    if backend not in ('docker', 'wsl'):
+        raise InstallError('--backend must be docker or wsl.')
+    if backend == 'wsl' and system != 'Windows':
+        raise InstallError('The native WSL2 backend is available only on Windows.')
+    checks = [('Git', ['git', '--version'])]
+    if backend == 'docker':
+        if not Path(gateway.DOCKER).is_file():
+            raise InstallError('Docker Desktop CLI not found; choose --backend wsl on Windows or install Docker Desktop.')
+        checks[0:0] = [
+            ('Docker Linux engine', [gateway.DOCKER, '--context', 'desktop-linux', 'info', '--format', '{{.OSType}}']),
+            ('Compose', [gateway.DOCKER, '--context', 'desktop-linux', 'compose', 'version', '--short']),
+        ]
+    else:
+        checks.insert(0, ('WSL', [hostlib.wsl_executable(), '--version']))
     if system == 'Windows':
         checks.append(('PowerShell', [hostlib.powershell_executable(), '-NoLogo', '-NoProfile',
                                       '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()']))
@@ -137,6 +147,8 @@ def requirements(gateway, hostlib):
             raise InstallError(name + ' is unavailable; install/start it and retry.') from None
         if value.returncode:
             raise InstallError(name + ' is unavailable; no system settings were changed.')
+        if name == 'Docker Linux engine' and value.stdout.strip().lower() != 'linux':
+            raise InstallError('Docker Desktop must use Linux containers; Windows containers are unsupported.')
         print(name + ': available')
     print(system + ' architecture: ' + platform.machine() + '; Python: ' + platform.python_version())
     print('Browser: available' if any(p.is_file() for p in hostlib.browser_candidates())
@@ -151,7 +163,7 @@ def write_private(path, data, mode=0o600, hostlib=None, system=None):
 
 
 def install_files(package, target_home, profiles, python_executable, config_bytes, configuration,
-                  legacy_aliases=False, system=None, environ=None):
+                  legacy_aliases=False, system=None, environ=None, backend='docker'):
     """Install files only; do not run Docker, OpenVPN or any host network command."""
     import platform
     configlib = config_module(package)
@@ -188,7 +200,7 @@ def install_files(package, target_home, profiles, python_executable, config_byte
             write_private(root / 'config' / configuration['transports'][transport]['profile_file'], data,
                           hostlib=hostlib, system=system)
         write_private(root / 'settings.json', (json.dumps({
-            'default_transport': configuration['default_transport']}, indent=2) + '\n').encode(),
+            'default_transport': configuration['default_transport'], 'backend': backend}, indent=2) + '\n').encode(),
                       hostlib=hostlib, system=system)
         metadata = {
             'project': configlib.PROJECT,
@@ -200,6 +212,9 @@ def install_files(package, target_home, profiles, python_executable, config_byte
                 for kind, value in profiles.items()
             },
             'legacy_aliases': bool(legacy_aliases),
+            'installed_backend': backend,
+            'wsl_distro': None,
+            'wsl_created_by_project': False,
         }
         write_private(root / 'installation.json', (json.dumps(metadata, indent=2) + '\n').encode(),
                       hostlib=hostlib, system=system)
@@ -256,6 +271,8 @@ def main(argv=None):
                         help='profile path for one configured transport; repeat for every transport')
     parser.add_argument('--legacy-aliases', action='store_true',
                         help='also create corp-vpn/corp-browser aliases if those names are unused')
+    parser.add_argument('--backend', choices=('docker','wsl'), default='docker',
+                        help='initial backend; wsl is Docker-free and Windows-only')
     args = parser.parse_args(argv)
     os.umask(0o077)
     sys.dont_write_bytecode = True
@@ -291,7 +308,7 @@ def main(argv=None):
         missing = sorted(set(configuration['transports']) - set(paths))
         raise InstallError('Profiles are required for every transport; missing: ' + ', '.join(missing))
     profiles = load_profiles(paths, gateway, configuration) if paths else None
-    requirements(gateway, hostlib)
+    requirements(gateway, hostlib, args.backend)
     if profiles:
         print('Profiles: structurally compatible with gateway.toml; originals unchanged.')
     if args.check:
@@ -301,13 +318,18 @@ def main(argv=None):
         raise InstallError('Supply --config and either --profiles-dir or one --profile per transport.')
     root = install_files(PACKAGE, Path.home(), profiles, Path(sys.executable).resolve(),
                          config_bytes, configuration, args.legacy_aliases,
-                         system=hostlib.SYSTEM, environ=os.environ)
+                         system=hostlib.SYSTEM, environ=os.environ, backend=args.backend)
     print('Installed: ' + str(root))
     print('No VPN was started; host DNS/routes, global Git and browser profiles were not changed.')
     if hostlib.IS_WINDOWS:
         command = root/'bin'/'vpn-gateway.cmd'
-        print('Next: configure windows_outer_adapter_contains, enable the outer VPN, then run:')
-        print('  "'+str(command)+'" start')
+        print('Next: configure windows_outer_adapter_contains and enable the outer VPN.')
+        if args.backend == 'wsl':
+            print('Provision the separate Docker-free distro, then start:')
+            print('  "'+str(command)+'" install --backend wsl')
+            print('  "'+str(command)+'" start --backend wsl')
+        else:
+            print('  "'+str(command)+'" start --backend docker')
         print('For this PowerShell window only: $env:Path="'+str(root/'bin')+';$env:Path"')
     else:
         print('Next: enable your outer VPN, then run ~/.local/bin/vpn-gateway start')

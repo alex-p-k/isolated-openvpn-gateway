@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Container-only OpenVPN, firewall, DNS hook and sanitized lifecycle log."""
+"""Linux OpenVPN, fail-closed firewall, DNS hook and sanitized lifecycle log."""
 import ipaddress
 import json
 import os
@@ -13,8 +13,16 @@ import sys
 import tempfile
 import time
 
-STATE = Path('/state')
+BACKEND = os.environ.get('GATEWAY_BACKEND', 'docker')
+STATE = Path(os.environ.get('GATEWAY_STATE', '/state'))
 STATUS = STATE / 'status.json'
+CONFIG = Path(os.environ.get('GATEWAY_CONFIG', '/config/client.ovpn'))
+AUTH = Path(os.environ.get('GATEWAY_AUTH', '/run/credentials/auth'))
+RUNTIME = Path(os.environ.get('GATEWAY_RUNTIME', '/run'))
+RESOLV = Path(os.environ.get('GATEWAY_RESOLV_CONF', str(STATE / 'resolv.conf')))
+OUTER_RESOLV = Path(os.environ.get('GATEWAY_OUTER_RESOLV', '/etc/isolated-openvpn-gateway/resolv.outer'))
+SOCKS_UID = '10000'
+SOCKS_PORT = os.environ.get('GATEWAY_INTERNAL_SOCKS_PORT', '11080' if BACKEND == 'wsl' else '1080')
 BINARIES = {'ip': '/sbin/ip', 'iptables': '/usr/sbin/iptables', 'ip6tables': '/usr/sbin/ip6tables'}
 
 def command(*args, check=True):
@@ -40,13 +48,19 @@ def read_state():
         return {}
 
 def resolver(dns=(), domains=()):
-    # Update IN PLACE: the SOCKS container bind-mounts this inode.
-    text = ''.join('nameserver ' + x + '\n' for x in dns) or 'nameserver 127.0.0.1\n'
-    if domains:
-        text += 'search ' + ' '.join(domains[:6]) + '\n'
-    text += 'options timeout:2 attempts:2\n'
-    (STATE / 'resolv.conf').write_text(text)
-    (STATE / 'resolv.conf').chmod(0o644)
+    # Docker updates a bind-mounted inode. The dedicated WSL distro owns its
+    # /etc/resolv.conf because provisioning disables per-distro regeneration.
+    if dns:
+        text = ''.join('nameserver ' + x + '\n' for x in dns)
+        if domains:
+            text += 'search ' + ' '.join(domains[:6]) + '\n'
+        text += 'options timeout:2 attempts:2\n'
+    elif BACKEND == 'wsl' and OUTER_RESOLV.is_file():
+        text = OUTER_RESOLV.read_text()
+    else:
+        text = 'nameserver 127.0.0.1\noptions timeout:2 attempts:2\n'
+    RESOLV.write_text(text)
+    RESOLV.chmod(0o644)
 
 def pushed_dns(env):
     dns, domains = [], []
@@ -114,8 +128,8 @@ def initialization_event(protocol):
     data['phase']='ready' if data['ready'] else 'hook-failed'
     write_state(data)
 
-def firewall(endpoint, port, protocol):
-    # Each rule is inside this container namespace, never macOS.
+def docker_firewall(endpoint, port, protocol):
+    # Each rule is inside this container namespace, never the host OS.
     for tool in ('iptables', 'ip6tables'):
         for chain in ('INPUT', 'OUTPUT', 'FORWARD'):
             command(tool, '-P', chain, 'DROP')
@@ -145,6 +159,77 @@ def firewall(endpoint, port, protocol):
     command('ip', 'rule', 'add', 'priority', '90', 'ipproto', 'tcp', 'sport', '1080', 'lookup', '101')
     command('ip', 'rule', 'add', 'priority', '100', 'uidrange', '10000-10000', 'lookup', '100')
 
+
+def delete_rule(*args):
+    for _ in range(16):
+        if command('ip', 'rule', 'del', *args, check=False).returncode:
+            break
+
+
+def wsl_firewall(endpoint, _port, _protocol):
+    """Constrain only the dedicated SOCKS UID in this managed WSL distro."""
+    routes = json.loads(command('ip', '-j', '-4', 'route', 'show', 'default').stdout)
+    route = next(item for item in routes if item.get('dev') and item.get('dev') != 'tun0')
+    outer = route['dev']
+    endpoint_route = ['ip', 'route', 'replace', endpoint + '/32']
+    if route.get('gateway'):
+        endpoint_route += ['via', route['gateway']]
+    endpoint_route += ['dev', outer]
+    command(*endpoint_route)
+
+    delete_rule('priority', '100', 'uidrange', SOCKS_UID + '-' + SOCKS_UID, 'lookup', '100')
+    command('ip', 'route', 'flush', 'table', '100', check=False)
+    command('ip', 'route', 'replace', 'unreachable', 'default', 'table', '100', 'metric', '32767')
+    command('ip', 'rule', 'add', 'priority', '100', 'uidrange', SOCKS_UID + '-' + SOCKS_UID,
+            'lookup', '100')
+
+    chains = (('iptables', 'IOVG_WSL_PROXY'), ('ip6tables', 'IOVG_WSL_PROXY6'))
+    for tool, chain in chains:
+        command(tool, '-N', chain, check=False)
+        command(tool, '-F', chain)
+        for _ in range(16):
+            if command(tool, '-D', 'OUTPUT', '-m', 'owner', '--uid-owner', SOCKS_UID,
+                       '-j', chain, check=False).returncode:
+                break
+        command(tool, '-I', 'OUTPUT', '1', '-m', 'owner', '--uid-owner', SOCKS_UID, '-j', chain)
+    command('iptables', '-A', 'IOVG_WSL_PROXY', '-o', 'lo', '-j', 'ACCEPT')
+    command('iptables', '-A', 'IOVG_WSL_PROXY', '-o', 'tun0', '-j', 'ACCEPT')
+    command('iptables', '-A', 'IOVG_WSL_PROXY', '-j', 'REJECT', '--reject-with', 'icmp-admin-prohibited')
+    command('ip6tables', '-A', 'IOVG_WSL_PROXY6', '-o', 'lo', '-j', 'ACCEPT')
+    command('ip6tables', '-A', 'IOVG_WSL_PROXY6', '-j', 'REJECT')
+    data = read_state()
+    data.update(firewall_backend='wsl', firewall_endpoint=endpoint, outer_interface=outer,
+                proxy_uid=int(SOCKS_UID), policy_table=100)
+    write_state(data)
+
+
+def firewall(endpoint, port, protocol):
+    if BACKEND == 'wsl':
+        wsl_firewall(endpoint, port, protocol)
+    else:
+        docker_firewall(endpoint, port, protocol)
+
+
+def cleanup_firewall():
+    """Remove only rules/routes owned by this managed WSL backend."""
+    if BACKEND != 'wsl':
+        return
+    delete_rule('priority', '100', 'uidrange', SOCKS_UID + '-' + SOCKS_UID, 'lookup', '100')
+    command('ip', 'route', 'flush', 'table', '100', check=False)
+    data = read_state()
+    endpoint = data.get('firewall_endpoint')
+    if endpoint:
+        command('ip', 'route', 'del', str(endpoint) + '/32', check=False)
+    for tool, chain in (('iptables', 'IOVG_WSL_PROXY'), ('ip6tables', 'IOVG_WSL_PROXY6')):
+        for _ in range(16):
+            if command(tool, '-D', 'OUTPUT', '-m', 'owner', '--uid-owner', SOCKS_UID,
+                       '-j', chain, check=False).returncode:
+                break
+        command(tool, '-F', chain, check=False)
+        command(tool, '-X', chain, check=False)
+    data.update(ready=False, routes_ready=False, firewall_removed=True)
+    write_state(data)
+
 def endpoint_config(text):
     remote, proxy = None, None
     block = False
@@ -166,13 +251,15 @@ def endpoint_config(text):
     endpoint = socket.getaddrinfo(endpoint_name, None, socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
     if not proxy:
         text = re.sub(r'(?m)^remote\s+[^\r\n]+', f'remote {endpoint} {remote[2]} {remote[3]}', text)
+    else:
+        text = re.sub(r'(?m)^http-proxy\s+[^\r\n]+', f'http-proxy {endpoint} {proxy[2]}', text)
     protocol = 'tcp' if proxy or 'tcp' in remote[3].lower() else 'udp'
     return text, endpoint, int(proxy[2] if proxy else remote[2]), protocol
 
 def healthy():
     data = read_state()
     result = command('ip', '-4', '-o', 'addr', 'show', 'dev', 'tun0', check=False)
-    route = command('ip', '-4', 'route', 'get', '1.1.1.1', 'uid', '10000', check=False)
+    route = command('ip', '-4', 'route', 'get', '1.1.1.1', 'uid', SOCKS_UID, check=False)
     return bool(data.get('ready') and result.returncode == 0 and 'inet ' in result.stdout
                 and route.returncode == 0 and 'dev tun0' in route.stdout)
 
@@ -200,25 +287,28 @@ def safe_line(line, secrets):
 
 def supervise():
     os.umask(0o077)
-    STATE.mkdir(exist_ok=True)
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     resolver()
     write_state({'ready': False, 'initialization_completed':False, 'phase':'starting',
                  'dns_pushed': False, 'started_at': time.time()})
-    text, endpoint, port, protocol = endpoint_config(Path('/config/client.ovpn').read_text())
+    text, endpoint, port, protocol = endpoint_config(CONFIG.read_text())
     firewall(endpoint, port, protocol)
-    Path('/run/client.ovpn').write_text(text)
-    secrets = Path('/run/credentials/auth').read_text().splitlines()
-    args = ['/usr/sbin/openvpn', '--config', '/run/client.ovpn', '--auth-user-pass', '/run/credentials/auth',
+    runtime_profile = RUNTIME / 'client.ovpn'
+    runtime_profile.write_text(text)
+    runtime_profile.chmod(0o600)
+    secrets = AUTH.read_text().splitlines()
+    args = ['/usr/sbin/openvpn', '--config', str(runtime_profile), '--auth-user-pass', str(AUTH),
             '--auth-nocache', '--auth-retry', 'none', '--dev', 'tun0', '--disable-dco',
             # Only UID 10000's table 100 sends proxy traffic through tun0.
             # Keep OpenVPN's automatic routes away from our pinned endpoint
             # and reply routes. Unlike route-nopull, this preserves pushed DNS.
-            '--route-noexec', '--script-security', '2', '--route-up', '/opt/gateway/vpn.py hook',
-            '--route-pre-down', '/opt/gateway/vpn.py hook', '--down', '/opt/gateway/vpn.py hook',
+            '--route-noexec', '--script-security', '2', '--route-up', str(Path(__file__).resolve())+' hook',
+            '--route-pre-down', str(Path(__file__).resolve())+' hook', '--down', str(Path(__file__).resolve())+' hook',
             '--down-pre', '--up-restart', '--verb', '3', '--connect-retry-max', '2',
             '--connect-timeout', '12', '--ping', '10', '--ping-restart', '60']
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    Path('/run/openvpn.pid').write_text(str(proc.pid))
+    (RUNTIME/'openvpn.pid').write_text(str(proc.pid))
     def terminate(*_):
         if proc.poll() is None:
             proc.terminate()
@@ -251,6 +341,10 @@ if __name__ == '__main__':
         sys.exit(run_hook())
     elif action == 'health':
         sys.exit(0 if healthy() else 1)
+    elif action == 'cleanup':
+        cleanup_firewall()
+        AUTH.unlink(missing_ok=True)
+        sys.exit(0)
     else:
         try:
             sys.exit(supervise())

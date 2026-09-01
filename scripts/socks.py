@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run unprivileged Dante only while the VPN supervisor reports a live tunnel."""
 import json
+import os
 import pathlib
 import signal
 import subprocess
@@ -16,10 +17,12 @@ def stop(*_):
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 generation = None
+state_path = pathlib.Path(os.environ.get('GATEWAY_STATE', '/state')) / 'status.json'
+sockd_config = os.environ.get('GATEWAY_SOCKD_CONFIG', '/etc/sockd.conf')
 try:
     while running:
         try:
-            state = json.loads(pathlib.Path('/state/status.json').read_text())
+            state = json.loads(state_path.read_text())
             addr = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'dev', 'tun0'], capture_output=True, text=True)
             live = state.get('ready') and state.get('connected_at') and addr.returncode == 0 and 'inet ' in addr.stdout
         except (ValueError, OSError):
@@ -35,7 +38,8 @@ try:
             child = None
         if live and child is None:
             # No request/target logs or raw resolver errors are persisted.
-            child = subprocess.Popen(['sockd', '-f', '/etc/sockd.conf'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            child = subprocess.Popen(['/usr/sbin/sockd', '-f', sockd_config],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             generation = new_generation
         time.sleep(0.5)
 finally:

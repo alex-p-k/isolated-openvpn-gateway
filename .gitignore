@@ -8,9 +8,17 @@
 /settings.json
 /git-changes.json
 /gateway.toml
+/.codegraph/
+/wsl/
 *.ovpn
 *.key
 *.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.pkcs12
+*.vhdx
 *.log
 __pycache__/
 .DS_Store

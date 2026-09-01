@@ -1,49 +1,89 @@
 # Isolated OpenVPN Gateway
 
-**Isolated OpenVPN Gateway** is a local client-side OpenVPN-to-SOCKS5 gateway for macOS and Windows. It runs the private OpenVPN client inside Docker Desktop and publishes that tunnel only as a loopback SOCKS5 proxy.
+Isolated OpenVPN Gateway is a local OpenVPN-to-SOCKS5 gateway for selected macOS and Windows applications. Corporate OpenVPN runs only inside an isolated Linux environment; it is never installed or started on the Windows host.
 
-It is not a VPN server, a system-wide VPN, or a public proxy.
+Windows has two independent backends:
+
+- `docker`: Docker Desktop, Linux containers and the `desktop-linux` context;
+- `wsl`: a project-owned WSL2 Debian distro named `IsolatedOpenVPNGateway`, without Docker Desktop.
+
+The existing command remains compatible and uses the backend saved at installation (default: `docker`):
 
 ```text
-selected host applications
-  -> socks5h://127.0.0.1:1080
-  -> Docker loopback publication
-  -> Dante (same network namespace as OpenVPN)
-  -> tun0 only
-  -> private network
-
-all other host traffic
-  -> unchanged host route / optional outer VPN
+vpn-gateway start
+vpn-gateway start --backend docker
+vpn-gateway start --backend wsl
 ```
 
-The source is organization-neutral. Deployment endpoints, transport names, profile filenames, DNS canary and SOCKS port live in a private `gateway.toml`. OpenVPN profiles and credentials are never included in a release archive.
+```text
+selected Windows Git/browser process
+  -> socks5h://127.0.0.1:1080
+  -> Docker loopback publication OR Windows loopback-only WSL stdio forwarder
+  -> Dante bound outbound to tun0
+  -> corporate network
+
+all ordinary host traffic
+  -> unchanged Windows/macOS routes and DNS
+  -> optional outer VPN
+```
+
+It is not a VPN server, a system-wide VPN, a public proxy, or a tool for installing corporate OpenVPN on Windows.
+
+## Windows support matrix
+
+| Backend | Windows Home | Windows Pro | Docker required |
+|---|---:|---:|---:|
+| docker-wsl2 | yes | yes | yes |
+| native-wsl2 | yes | yes | no |
+| Hyper-V VM | no | yes | no |
+
+`Hyper-V VM` is an optional manual fallback and is not implemented by this CLI. The supported CLI backends are `docker` and `wsl`. Neither requires Hyper-V Manager or Windows containers. WSL2 still runs a real Linux kernel in a lightweight utility VM, even when Docker Desktop is absent.
+
+Microsoft states that WSL2 is available on Windows 10/11 Home through the `Virtual Machine Platform` and `Windows Subsystem for Linux` optional components. Docker documents the WSL2 backend and notes that Home can run Linux containers, while Windows containers require Pro/Enterprise. Official references are at the end of this file.
 
 ## Security properties
 
-- OpenVPN runs only in a Docker Desktop Linux VM with `/dev/net/tun` and `NET_ADMIN`; `privileged: true` is not used.
-- Docker publishes only `127.0.0.1:PORT`; the LAN receives no proxy listener.
-- Dante binds outbound sockets to `tun0`. UID routing and firewall rules reject `eth0` fallback if the tunnel disappears.
-- Host DNS, routes and global Git configuration are read for validation but are never changed.
-- Credentials use hidden terminal input and a short-lived private runtime file. They are never passed in arguments or environment variables and are removed on stop, failure and the next start.
-- Private deployment files use mode `0600` on macOS. Windows files and directories receive a protected NTFS ACL for the current user SID with inherited access removed.
-- Original `.ovpn` files are read-only installer inputs. Profile directives are allowlisted and the exact remote and optional HTTP proxy must match `gateway.toml`.
-- The installer refuses Administrator/root execution, existing install paths, symlinks, malformed manifests and incompatible profiles.
+- Docker uses Linux containers, `/dev/net/tun`, `NET_ADMIN`, no `privileged: true`, and publishes only `127.0.0.1:PORT`.
+- Native WSL uses only the dedicated project-created distro. It never provisions the user's Ubuntu/Debian/default distro.
+- WSL creates a nested Linux network namespace inside the managed distro. OpenVPN, Dante, `tun0`, routes and firewall live there; `slirp4netns` provides only the outer control egress without adding routes/firewall rules to WSL's shared root network namespace.
+- WSL Dante listens on `127.0.0.1:11080` inside the nested namespace. A credential-free Windows process binds `127.0.0.1:PORT` and relays each connection through `wsl.exe` stdio; it has no direct network fallback.
+- Dante selects `tun0` as its outbound interface.
+- A second independent layer routes UID `10000` only through table 100 and rejects that UID in a dedicated `iptables`/`ip6tables` chain when `tun0` is absent. The rules are named, deterministic, idempotent and confined to the nested namespace, so the shared root namespace and other WSL distros are not filtered.
+- OpenVPN resolves and pins its public control endpoint before corporate DNS is applied. Its root control process retains the normal WSL route; the SOCKS UID does not.
+- Host DNS, routes, Windows Firewall and global Git configuration are read for validation but never changed.
+- The tool never edits `%USERPROFILE%\.wslconfig`, changes NAT/mirrored mode, runs `netsh portproxy`, creates Windows Firewall rules, or changes Windows NRPT.
+- Credentials use hidden terminal input. They are never arguments or environment variables. Docker uses the protected host runtime file; WSL transfers them over stdin into a mode-`0600` runtime file. Stop, failed start and the next start remove stale credentials.
+- Private deployment files receive mode `0600` on macOS. Windows files/directories receive a protected current-SID NTFS ACL with inheritance removed.
+- Original `.ovpn` files are read-only installer inputs. The derived runtime profile is allowlisted and endpoint-checked; profile content, inline keys and credentials are never printed.
 
 ## Requirements
 
-- macOS arm64/x86_64, or Windows 10/11 AMD64. Windows ARM64 additionally depends on Docker Desktop Arm Early Access.
-- Docker Desktop running **Linux containers** with the `desktop-linux` context
-- Python 3.11 or newer
-- Git
-- Chrome, Chromium or Microsoft Edge for the optional isolated browser
+Common:
 
-On Windows, Docker Desktop's WSL 2 backend is the expected lightweight backend. The Hyper-V Linux backend can also work, but the Linux VM must expose `/dev/net/tun`. Startup tests that device before asking for credentials.
+- Python 3.11 or newer;
+- Git;
+- x86_64/AMD64 or ARM64 Windows, or arm64/x86_64 macOS;
+- Chrome, Chromium or Edge only if the isolated browser is wanted;
+- an already connected outer VPN when `require_outer_vpn=true`.
 
-Docker outbound traffic must have the same public egress as the host. When `require_outer_vpn=true`, startup also verifies the selected public route: `utun*` on macOS or a configured connected adapter on Windows. If Docker bypasses the outer VPN, startup stops before OpenVPN authentication.
+Docker backend:
 
-## Deployment configuration
+- Docker Desktop using Linux containers;
+- `desktop-linux` context and Compose;
+- WSL2 backend is the normal Windows Home path; full Hyper-V Manager is not required.
 
-Copy `gateway.example.toml` outside the source package and replace the examples with values from IT-issued profiles. Keep it private. Transport names are arbitrary; `udp` and `tcp` are conventions.
+WSL backend:
+
+- Windows 10/11 with WSL 2.4.4 or newer;
+- WSL2 and hardware virtualization enabled;
+- network access during provisioning for Debian `apt` packages;
+- no Docker Desktop.
+
+Startup always checks `/dev/net/tun`, the selected outer-VPN route and equal host/backend public egress before requesting corporate credentials. A mismatch is a blocker, not a warning.
+
+## Private deployment configuration
+
+Keep `gateway.toml` and IT-issued `.ovpn` files outside the source package. Never commit them.
 
 ```toml
 [gateway]
@@ -53,8 +93,8 @@ default_transport = "udp"
 dns_canary = "internal.example.com"
 socks_port = 1080
 require_outer_vpn = true
-outer_interface_prefix = "utun" # macOS
-windows_outer_adapter_contains = ["Distinctive VPN adapter name"] # Windows
+outer_interface_prefix = "utun"
+windows_outer_adapter_contains = ["Distinctive outer VPN adapter name"]
 
 [transports.udp]
 profile_file = "company-udp.ovpn"
@@ -64,78 +104,103 @@ remote_protocol = "udp4"
 required_inline_blocks = ["ca", "tls-auth"]
 ```
 
-`windows_outer_adapter_contains` contains one or more distinctive, case-insensitive substrings from the Windows adapter `Name` or `InterfaceDescription`. The public route must use one of the matching interface indexes. See `WINDOWS.md` for the discovery command.
-
-Supported IPv4 client protocols are `udp`, `udp4`, `tcp-client`, and `tcp4-client`. Add `http_proxy_host` and `http_proxy_port` only when the profile contains the matching `http-proxy` directive. Set `require_outer_vpn=false` only when nesting is intentionally unnecessary.
-
-`dns_canary` is a harmless private hostname expected to return an A record through pushed private DNS. Do not put credentials, tokens or URLs with query strings in this file.
+Do not guess corporate hostnames or DNS addresses. `dns_canary` is a harmless private name supplied by the deployment owner. If OpenVPN pushes no DNS, status reports that fact and does not invent an address.
 
 ## Verify and install
 
-From an extracted release on macOS:
+macOS (Docker backend):
 
 ```bash
 shasum -a 256 -c isolated-openvpn-gateway-YYYY-MM-DD.zip.sha256
-python3 install.py --check --config "/private/path/gateway.toml" --profiles-dir "/private/path/profiles"
-python3 install.py         --config "/private/path/gateway.toml" --profiles-dir "/private/path/profiles"
+python3 install.py --check --backend docker --config "/private/gateway.toml" --profiles-dir "/private/profiles"
+python3 install.py         --backend docker --config "/private/gateway.toml" --profiles-dir "/private/profiles"
 ```
 
-On Windows PowerShell:
+Windows PowerShell, Docker backend:
 
 ```powershell
 Get-FileHash .\isolated-openvpn-gateway-YYYY-MM-DD.zip -Algorithm SHA256
-py -3.11 .\install.py --check --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
-py -3.11 .\install.py         --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+py -3.11 .\install.py --check --backend docker --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+py -3.11 .\install.py         --backend docker --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
 ```
 
-`--profiles-dir` resolves each `profile_file` from the TOML. For profiles in different directories, repeat `--profile NAME=PATH` once for every transport.
+Windows PowerShell, Docker-free WSL backend:
 
-Installation creates:
+```powershell
+py -3.11 .\install.py --check --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+py -3.11 .\install.py         --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+$env:Path = "$env:LOCALAPPDATA\IsolatedOpenVPNGateway\bin;$env:Path"
+vpn-gateway install --backend wsl
+vpn-gateway start --backend wsl
+```
+
+The first WSL command creates only `IsolatedOpenVPNGateway`. It installs OpenVPN, Dante, iproute2, iptables, `slirp4netns`, curl and Python inside that distro. It does not install into the default distro and does not change the default distro.
+
+Installation paths:
 
 | Host | Gateway | Commands | Browser profile |
 |---|---|---|---|
 | macOS | `~/.local/share/isolated-openvpn-gateway` | `~/.local/bin/vpn-gateway`, `vpn-browser` | `~/.local/share/isolated-openvpn-browser` |
 | Windows | `%LOCALAPPDATA%\IsolatedOpenVPNGateway` | `...\bin\vpn-gateway.cmd`, `vpn-browser.cmd` | `%LOCALAPPDATA%\IsolatedOpenVPNBrowser` |
 
-No command is added to a global PATH. Optional `--legacy-aliases` creates `corp-vpn` and `corp-browser` only when those names are unused.
+No command is added to a global PATH. `--profiles-dir` resolves `profile_file`; repeated `--profile NAME=PATH` supports separate private directories.
 
-## Commands
+## Commands and backend choice
 
 ```text
-vpn-gateway start                 # configured default transport
-vpn-gateway start TRANSPORT
+vpn-gateway install --backend wsl
+vpn-gateway install --backend docker
+vpn-gateway backend set docker|wsl
+vpn-gateway start [TRANSPORT] [--backend docker|wsl]
 vpn-gateway stop
 vpn-gateway restart [TRANSPORT]
 vpn-gateway status
 vpn-gateway logs
 vpn-gateway test [https://private-host/]
-vpn-gateway compare-transports
+vpn-gateway compare-transports [--backend docker|wsl]
 vpn-gateway git-configure PATH_TO_REPOSITORY
 vpn-gateway build
+vpn-gateway uninstall --backend wsl
 vpn-gateway uninstall
 vpn-browser [https://private-host/]
 ```
 
-Use the `.cmd` path or add its directory to the current PowerShell session on Windows. `start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route hook succeeds, `tun0` exists and a SOCKS5 handshake passes. `compare-transports` also performs a real fail-closed test and selects the first fully usable transport.
+`backend set` changes only the saved future choice and never switches a running session. An explicit `--backend` overrides the saved choice for that command. `stop`, `status`, `logs` and `test` use the recorded active backend.
 
-## DNS, browser and Git
+`start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route/DNS hook succeeds, `tun0` exists and SOCKS5 handshake succeeds. `compare-transports` performs a positive control, stops only OpenVPN, proves the SOCKS request and forced outer-interface request fail, restores the session and selects the first fully usable transport.
 
-Pushed `dhcp-option DNS` and search domains are applied only inside the VPN/SOCKS namespace. `socks5h`, the SSH bridge and the isolated browser send target hostnames to the proxy side. Host system DNS remains untouched. If the server pushes no DNS, status reports that fact.
+## Corporate DNS, Git and browser
 
-`vpn-browser` creates a separate profile, disables QUIC, direct WebRTC UDP, browser DNS-over-HTTPS and local target DNS. It has no `direct://` fallback and never edits the main browser profile.
+Pushed `dhcp-option DNS`, `DOMAIN` and `DOMAIN-SEARCH` are applied only to the Docker namespace or managed WSL distro. Disconnect restores the distro's pre-provisioning WSL resolver for public OpenVPN control traffic. Windows DNS, outer-VPN DNS, global NRPT and other WSL distros are untouched.
 
-`vpn-gateway git-configure` changes only the selected repository and remote:
+Clients resolve target hostnames proxy-side:
 
-- HTTPS: repository-local `http.<exact-url>.proxy=socks5h://127.0.0.1:PORT`
-- SSH on macOS: repository-local `core.sshCommand` plus a host-specific private config and system `nc -X 5`
-- SSH on Windows: repository-local `core.sshCommand` plus a host-specific private config and the bundled Python SOCKS5 stdio bridge
+- HTTPS Git: repository-local `http.<exact-url>.proxy=socks5h://127.0.0.1:PORT`;
+- SSH Git: repository-local `core.sshCommand` and a hostname-preserving SOCKS stdio bridge;
+- Chromium/Edge: separate profile, SOCKS5, proxy-side DNS rules, QUIC/direct WebRTC disabled, no `direct://` fallback;
+- Firefox is not launched automatically; if configured manually, enable proxy DNS over SOCKS5 and use a separate profile.
 
-No global Git or SSH proxy is created. Test with `git -C PATH ls-remote REMOTE`; a push is unnecessary.
+No global Git proxy, global SSH `ProxyCommand`, remote URL or repository content is changed. Repositories remain on NTFS. Test with a read-only `git -C PATH ls-remote REMOTE`; never push merely for acceptance.
 
 ## Validation and rollback
 
-Run `vpn-gateway test` after connecting. It checks preservation of host DNS, routes, public egress and global Git settings; loopback-only publication; `tun0`; UID routing; forced-`eth0` blocking; SOCKS; and pushed DNS. Add a real private URL for an application-level connection test.
+Run `vpn-gateway test` after connecting. On Windows, run `tools\windows_acceptance.ps1` on the target Home machine for real positive/negative and host-preservation evidence. Unit tests and mocks do not prove real VPN behavior.
 
-`vpn-gateway uninstall` removes only installation-owned containers, image tags, launchers, copied profiles, runtime files and matching repository-local Git changes. Deleting the isolated browser profile requires a second confirmation. Docker Desktop, outer VPN software, repositories and global host settings remain.
+`vpn-gateway uninstall --backend wsl` unregisters only a distro whose Windows and Linux ownership markers both match this installation. Full uninstall removes only project-owned containers/image tags, managed WSL distro, launchers, copied private files, runtime state and matching repository-local Git changes. Docker Desktop, WSL itself, other distros, outer VPN software, repositories, host routes/DNS/Firewall and global Git settings remain.
 
-See `WINDOWS.md` for Windows installation and acceptance, `QUICKSTART.md` for short commands, `HANDOFF.md` for transfer, and `MIGRATION.md` for the older package.
+See `WINDOWS.md` for acceptance and NAT/mirrored handling, `ROLLBACK.md` for exact recovery boundaries, `QUICKSTART.md` for short commands and `HANDOFF.md` for safe transfer.
+
+## Official platform references
+
+- Microsoft: [Install WSL](https://learn.microsoft.com/windows/wsl/install)
+- Microsoft: [WSL basic commands, import/export/unregister](https://learn.microsoft.com/windows/wsl/basic-commands)
+- Microsoft: [WSL networking, NAT and mirrored mode](https://learn.microsoft.com/windows/wsl/networking)
+- Microsoft: [systemd on WSL](https://learn.microsoft.com/windows/wsl/systemd)
+- Microsoft: [WSL FAQ — Home support and Virtual Machine Platform](https://learn.microsoft.com/windows/wsl/faq)
+- Microsoft: [What is WSL — shared and isolated namespaces](https://learn.microsoft.com/windows/wsl/about)
+- Docker: [Install Docker Desktop on Windows](https://docs.docker.com/desktop/setup/install/windows-install/)
+- Docker: [Docker Desktop WSL2 backend](https://docs.docker.com/desktop/features/wsl/)
+
+## Verification status of this revision
+
+The development host was identified as Windows 11 Home Single Language by `EditionID=CoreSingleLanguage`, display version `25H2` and build `26200.9168` (the legacy registry `ProductName` compatibility string still says Windows 10). It is AMD64 with 31.8 GiB RAM, SLAT and firmware virtualization enabled. WSL and Docker were not installed, and public-IP DNS resolution was unavailable. Therefore only host-edition diagnostics, source/static checks and platform-simulation tests ran here. Real Docker, WSL, OpenVPN, SOCKS positive/negative, corporate DNS, Git and browser acceptance remain explicitly unverified until `tools\windows_acceptance.ps1` passes on a fully provisioned Windows 11 Home target.

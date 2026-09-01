@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -20,6 +21,7 @@ from urllib.parse import urlsplit
 from gateway_config import (BROWSER_CLI, CLI, PROJECT, SOCKS_IMAGE, VPN_IMAGE,
                             ConfigError, load_config)
 import host
+import wsl_backend
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / 'runtime'
@@ -29,9 +31,12 @@ PREFS = ROOT / 'settings.json'
 DOCKER = host.docker_executable()
 CURL = host.curl_executable()
 POWERSHELL = host.powershell_executable()
+WSL = host.wsl_executable()
 IP_URL = 'https://api.ipify.org'
 IMAGE = VPN_IMAGE
 ENV = {k:v for k,v in os.environ.items() if k not in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')}
+WSL_DISTRO = wsl_backend.DISTRO
+FORWARDER_PID = RUNTIME / 'wsl-forwarder.pid'
 
 class GatewayError(Exception):
     pass
@@ -77,10 +82,81 @@ def read_json(path, default=None):
         return {} if default is None else default
 
 def preferences():
-    return read_json(PREFS, {'default_transport':'udp'})
+    return read_json(PREFS, {'default_transport':'udp', 'backend':'docker'})
 
 def save_preferences(data):
     private_write(PREFS, json.dumps(data, indent=2)+'\n')
+
+def backend_name(explicit=None):
+    value = explicit or preferences().get('backend', 'docker')
+    if value not in ('docker', 'wsl'):
+        raise GatewayError('Backend must be docker or wsl.')
+    if value == 'wsl' and not host.IS_WINDOWS:
+        raise GatewayError('The native WSL2 backend is available only on Windows; use docker on macOS.')
+    return value
+
+def active_backend(explicit=None):
+    if explicit:
+        return backend_name(explicit)
+    path = RUNTIME/'active-backend'
+    if path.is_file():
+        value = path.read_text().strip()
+        if value in ('docker','wsl'):
+            return backend_name(value)
+    return backend_name()
+
+def parse_cli(argv):
+    values = list(argv)
+    backend = None
+    positionals = []
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == '--backend':
+            if backend is not None or index + 1 >= len(values):
+                raise GatewayError('--backend requires one value: docker or wsl.')
+            backend = values[index + 1]
+            index += 2
+            continue
+        if value.startswith('--backend='):
+            if backend is not None:
+                raise GatewayError('--backend may be supplied only once.')
+            backend = value.split('=', 1)[1]
+            index += 1
+            continue
+        if value.startswith('-') and value not in ('-h','--help'):
+            raise GatewayError('Unknown option: ' + value)
+        positionals.append(value)
+        index += 1
+    action = positionals.pop(0) if positionals else 'status'
+    return action, positionals, backend
+
+def wsl(*args, input=None, **kwargs):
+    kwargs.setdefault('encoding', 'utf-8')
+    kwargs.setdefault('errors', 'replace')
+    return run(wsl_backend.wsl_command(*args, executable=WSL), input=input, **kwargs)
+
+def wsl_names():
+    result = run([WSL, '--list', '--quiet'], check=False, timeout=20)
+    return wsl_backend.distro_names(result.stdout) if result.returncode == 0 else []
+
+def wsl_owned():
+    marker = read_json(ROOT/'installation.json')
+    if marker.get('wsl_distro') != WSL_DISTRO or not marker.get('wsl_created_by_project'):
+        return False
+    result = wsl('/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', 'status',
+                 check=False, timeout=20)
+    try:
+        return result.returncode == 0 and json.loads(result.stdout).get('owned') is True
+    except (TypeError, ValueError):
+        return False
+
+def update_installation(**values):
+    marker = read_json(ROOT/'installation.json')
+    if marker.get('project') != PROJECT:
+        raise GatewayError('Installation ownership marker is absent.')
+    marker.update(values)
+    private_write(ROOT/'installation.json', json.dumps(marker, indent=2)+'\n')
 
 def socks_available():
     try:
@@ -233,8 +309,11 @@ def compare_host(before, after):
             'global_git_proxy_preserved':before['git_global_proxy'] == after['git_global_proxy']}
 
 def engine():
-    if docker('info','--format','{{.Name}}',check=False).returncode:
+    result = docker('info','--format','{{.OSType}}',check=False)
+    if result.returncode:
         raise GatewayError('Docker Desktop Engine is stopped. Start Docker Desktop, then retry.')
+    if result.stdout.strip().lower() != 'linux':
+        raise GatewayError('Docker backend requires Docker Desktop Linux containers; Windows containers are unsupported.')
 
 def images():
     for image in (IMAGE, SOCKS_IMAGE):
@@ -243,7 +322,131 @@ def images():
             compose('build', timeout=600, capture=False)
             return
 
-def preflight():
+def wsl_version():
+    result = run([WSL, '--version'], check=False, timeout=20)
+    return result.stdout + result.stderr
+
+def wsl_path(path):
+    result = wsl('/usr/bin/wslpath', '-a', '-u', str(Path(path).resolve()), timeout=20)
+    value = wsl_backend.normalize_output(result.stdout).strip()
+    if not value.startswith('/') or any(character in value for character in ('\r','\n','\x00')):
+        raise GatewayError('WSL could not map an installation path safely.')
+    return value
+
+def copy_wsl_asset(source, destination, mode='0555'):
+    source = Path(source)
+    if not source.is_file() or source.is_symlink():
+        raise GatewayError('Managed WSL source asset is missing or unsafe: ' + source.name)
+    wsl('/usr/bin/install', '-D', '-m', mode, wsl_path(source), destination, timeout=30)
+
+def install_backend(selected):
+    selected = backend_name(selected)
+    if selected == 'docker':
+        engine(); images()
+        print('Docker backend is available. The saved backend was not changed.')
+        return
+    version = wsl_version()
+    if not wsl_backend.modern_install_supported(version):
+        raise GatewayError('WSL 2.4.4 or newer is required for a separately named managed distro. '
+                           'Install/update WSL, reboot if requested, then retry; Docker is not required.')
+    existing = wsl_names()
+    if WSL_DISTRO in existing:
+        if wsl_owned():
+            print('Managed WSL backend is already installed. The saved backend was not changed.')
+            return
+        raise GatewayError('A WSL distro named '+WSL_DISTRO+' already exists but is not owned by this installation. '
+                           'It was not modified or adopted.')
+    location = ROOT/'wsl'
+    if location.exists() and any(location.iterdir()):
+        raise GatewayError('Managed WSL storage path already exists and is not empty; nothing was changed.')
+    host.private_directory(location, parents=True, exist_ok=True)
+    created = False
+    try:
+        result = run(wsl_backend.install_command(location, executable=WSL), check=False,
+                     timeout=900, capture=False)
+        if result.returncode or WSL_DISTRO not in wsl_names():
+            raise GatewayError('WSL could not install the separate Debian distro. A reboot or one-time '
+                               'Administrator WSL enablement may be required.')
+        created = True
+        run([WSL, '--set-version', WSL_DISTRO, '2'], timeout=300, capture=False)
+        print('Installing OpenVPN, Dante, firewall and diagnostic packages in the managed WSL distro.', flush=True)
+        wsl('/usr/bin/env', 'DEBIAN_FRONTEND=noninteractive', '/usr/bin/apt-get', 'update',
+            timeout=600, capture=False)
+        wsl('/usr/bin/env', 'DEBIAN_FRONTEND=noninteractive', '/usr/bin/apt-get', 'install',
+            '-y', '--no-install-recommends', 'openvpn',
+            'dante-server', 'iproute2', 'iptables', 'curl', 'ca-certificates', 'python3',
+            'slirp4netns', 'util-linux',
+            timeout=900, capture=False)
+        wsl('/usr/bin/install', '-d', '-m', '0700', '/opt/isolated-openvpn-gateway',
+            '/etc/isolated-openvpn-gateway', '/var/lib/isolated-openvpn-gateway/state', timeout=30)
+        assets = {
+            ROOT/'scripts'/'vpn.py': ('/opt/isolated-openvpn-gateway/vpn.py', '0555'),
+            ROOT/'scripts'/'socks.py': ('/opt/isolated-openvpn-gateway/socks.py', '0555'),
+            ROOT/'scripts'/'wsl_bridge.py': ('/opt/isolated-openvpn-gateway/wsl_bridge.py', '0555'),
+            ROOT/'scripts'/'wsl_manager.py': ('/opt/isolated-openvpn-gateway/wsl_manager.py', '0555'),
+            ROOT/'scripts'/'wsl_sockd.conf': ('/etc/isolated-openvpn-gateway/sockd.conf', '0444'),
+        }
+        for source, (destination, mode) in assets.items():
+            copy_wsl_asset(source, destination, mode)
+        wsl('/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', 'provision',
+            timeout=60)
+        update_installation(wsl_distro=WSL_DISTRO, wsl_created_by_project=True,
+                            wsl_location=str(location))
+        run(wsl_backend.terminate_command(executable=WSL), check=False, timeout=30)
+        result = wsl('/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', 'status',
+                     check=False, timeout=30)
+        if result.returncode:
+            raise GatewayError('Managed WSL distro was provisioned but did not restart cleanly.')
+        print('Managed WSL2 backend installed without Docker Desktop. The saved backend was not changed.')
+    except BaseException:
+        if created:
+            run(wsl_backend.unregister_command(executable=WSL), check=False, timeout=180, capture=False)
+            update_installation(wsl_distro=None, wsl_created_by_project=False, wsl_location=None)
+        with contextlib.suppress(OSError):
+            if location.exists() and not any(location.iterdir()):
+                location.rmdir()
+        raise
+
+def uninstall_wsl_backend(confirm=True):
+    marker = read_json(ROOT/'installation.json')
+    if marker.get('wsl_distro') != WSL_DISTRO or not marker.get('wsl_created_by_project'):
+        raise GatewayError('This installation does not own a managed WSL distro; nothing was removed.')
+    if confirm and input('Unregister only the project-owned '+WSL_DISTRO+' distro? Type REMOVE WSL: ') != 'REMOVE WSL':
+        return False
+    stop_internal(backend='wsl')
+    if not wsl_owned():
+        raise GatewayError('Managed WSL ownership marker is absent; refusing to unregister the distro.')
+    result = run(wsl_backend.unregister_command(executable=WSL), check=False, timeout=180, capture=False)
+    if result.returncode:
+        raise GatewayError('WSL could not unregister the project-owned distro.')
+    location = Path(marker.get('wsl_location') or ROOT/'wsl')
+    if location.name == 'wsl' and location.resolve().parent == ROOT.resolve() and location.exists() and not location.is_symlink():
+        shutil.rmtree(location)
+    if (RUNTIME/'active-backend').is_file() and (RUNTIME/'active-backend').read_text().strip() == 'wsl':
+        (RUNTIME/'active-backend').unlink()
+    update_installation(wsl_distro=None, wsl_created_by_project=False, wsl_location=None)
+    print('Project-owned WSL distro removed. WSL itself and all other distros were preserved.')
+    return True
+
+def verify_outer_host(before, cfg):
+    if not before.get('diagnostics_ok'):
+        raise GatewayError('Host route/DNS diagnostics are unavailable. Inner OpenVPN was not started.')
+    if not cfg['require_outer_vpn']:
+        return
+    if host.IS_WINDOWS:
+        needles = cfg['windows_outer_adapter_contains']
+        if not needles:
+            raise GatewayError('Windows deployment must configure windows_outer_adapter_contains before startup.')
+        if not windows_outer_route_matches(before, needles):
+            raise GatewayError('The selected Windows public route does not use a configured outer VPN adapter. '
+                               'Inner OpenVPN was not started.')
+    else:
+        prefix = re.escape(cfg['outer_interface_prefix'])
+        if not re.search(r'interface:\s+' + prefix + r'\d+', before['public_route']['stdout']):
+            raise GatewayError('No active outer VPN route on ' + cfg['outer_interface_prefix'] +
+                               '*. Connect the required outer VPN before starting.')
+
+def docker_preflight():
     engine(); images()
     cfg = configuration()
     tun = docker('run','--rm','--cap-drop','ALL','--device','/dev/net/tun:/dev/net/tun',
@@ -252,52 +455,160 @@ def preflight():
     if tun.returncode:
         raise GatewayError('Docker Desktop cannot expose /dev/net/tun to a Linux container. Inner OpenVPN was not started.')
     before = network_snapshot()
-    if not before.get('diagnostics_ok'):
-        raise GatewayError('Host route/DNS diagnostics are unavailable. Inner OpenVPN was not started.')
-    if cfg['require_outer_vpn']:
-        if host.IS_WINDOWS:
-            needles = cfg['windows_outer_adapter_contains']
-            if not needles:
-                raise GatewayError('Windows deployment must configure windows_outer_adapter_contains before startup.')
-            if not windows_outer_route_matches(before, needles):
-                raise GatewayError('The selected Windows public route does not use a configured outer VPN adapter. '
-                                   'Inner OpenVPN was not started.')
-        else:
-            prefix = re.escape(cfg['outer_interface_prefix'])
-            if not re.search(r'interface:\s+' + prefix + r'\d+', before['public_route']['stdout']):
-                raise GatewayError('No active outer VPN route on ' + cfg['outer_interface_prefix'] +
-                                   '*. Connect the required outer VPN before starting.')
+    verify_outer_host(before, cfg)
     result = docker('run','--rm','--cap-drop','ALL','--read-only','--security-opt','no-new-privileges',
                     '--entrypoint','curl',IMAGE,'-4','--noproxy','*','-fsS','--max-time','15',IP_URL, timeout=25)
     container_ip = result.stdout.strip()
     if not before['public_ip'] or container_ip != before['public_ip']:
         raise GatewayError('Outer path check failed: host/container egress differs or is unavailable. Inner VPN was not started.')
     before['docker_public_ip'] = container_ip
+    before['backend'] = 'docker'
     private_write(ROOT/'validation'/'before.json', json.dumps(before,indent=2))
     print('Outer VPN preflight passed: host = Docker = '+container_ip,flush=True)
     return before
 
+def wsl_preflight():
+    if not host.IS_WINDOWS:
+        raise GatewayError('The WSL backend is Windows-only.')
+    if WSL_DISTRO not in wsl_names() or not wsl_owned():
+        raise GatewayError('Managed WSL backend is not installed. Run '+CLI+' install --backend wsl first.')
+    listing = run([WSL, '--list', '--verbose'], check=False, timeout=20)
+    if wsl_backend.distro_version(listing.stdout, WSL_DISTRO) != 2:
+        raise GatewayError('The managed distro must use WSL2. Inner OpenVPN was not started.')
+    tun = wsl('/usr/bin/test', '-c', '/dev/net/tun', check=False, timeout=20)
+    if tun.returncode:
+        raise GatewayError('/dev/net/tun is unavailable in the managed WSL2 distro. Inner OpenVPN was not started.')
+    before = network_snapshot()
+    verify_outer_host(before, configuration())
+    result = wsl_manager('network-egress', check=False, timeout=35)
+    distro_ip = wsl_backend.parse_public_ip(result.stdout)
+    if not before['public_ip'] or distro_ip != before['public_ip']:
+        wsl_manager('network-stop', check=False, timeout=20)
+        raise GatewayError('Outer path check failed: Windows/WSL egress differs or is unavailable. '
+                           'Inner VPN was not started; review NAT/mirrored compatibility with the outer VPN.')
+    before.update(wsl_public_ip=distro_ip, backend='wsl',
+                  wsl_networking_mode=wsl_backend.networking_mode(Path.home()/'.wslconfig'))
+    private_write(ROOT/'validation'/'before.json', json.dumps(before, indent=2))
+    print('Outer VPN preflight passed: Windows = WSL = '+distro_ip+'; networking mode = '+
+          before['wsl_networking_mode'], flush=True)
+    return before
+
+def preflight(backend='docker'):
+    return wsl_preflight() if backend_name(backend) == 'wsl' else docker_preflight()
+
 def container_id(service):
     return compose('ps','--all','--quiet',service,check=False).stdout.strip()
 
-def ready():
-    return bool(read_json(STATE/'status.json').get('ready')) and socks_available()
+def wsl_manager(action, *, input=None, check=True, timeout=40):
+    return wsl('/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', action,
+               input=input, check=check, timeout=timeout)
 
-def cleanup_auth():
+def wsl_status_data():
+    if WSL_DISTRO not in wsl_names():
+        return {}
+    result = wsl_manager('status', check=False, timeout=20)
+    try:
+        return json.loads(result.stdout) if result.returncode == 0 else {}
+    except (TypeError, ValueError):
+        return {}
+
+def windows_listener_records(port):
+    command = ("$x=Get-NetTCPConnection -State Listen -LocalPort " + str(int(port)) +
+               " -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess; "
+               "ConvertTo-Json -Compress -Depth 4 -InputObject @($x)")
+    result = run(powershell(command), check=False, timeout=20)
+    try:
+        value = json.loads(result.stdout) if result.returncode == 0 else []
+        return value if isinstance(value, list) else [value]
+    except (TypeError, ValueError):
+        return []
+
+def listener_result():
+    cfg = configuration()
+    if host.IS_WINDOWS:
+        return wsl_backend.listener_validation(windows_listener_records(cfg['socks_port']), cfg['socks_port'])
+    return {'listener_present': socks_available(), 'loopback_only': True,
+            'ipv4_wildcard_absent': True, 'ipv6_wildcard_absent': True, 'addresses':['127.0.0.1']}
+
+def listener_pid(record):
+    try:
+        return int(record.get('OwningProcess', -1)) if isinstance(record, dict) else -1
+    except (TypeError, ValueError):
+        return -1
+
+def stop_forwarder():
+    if not FORWARDER_PID.is_file():
+        return
+    try:
+        pid = int(FORWARDER_PID.read_text())
+    except (OSError, ValueError):
+        FORWARDER_PID.unlink(missing_ok=True)
+        return
+    records = windows_listener_records(configuration()['socks_port']) if host.IS_WINDOWS else []
+    owns_listener = any(str(item.get('LocalAddress')) == '127.0.0.1' and listener_pid(item) == pid
+                        for item in records if isinstance(item, dict))
+    if owns_listener:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(listener_pid(item) == pid for item in
+                windows_listener_records(configuration()['socks_port'])):
+            time.sleep(0.2)
+    FORWARDER_PID.unlink(missing_ok=True)
+
+def start_forwarder():
+    if not host.IS_WINDOWS:
+        raise GatewayError('The WSL loopback forwarder requires Windows.')
+    stop_forwarder()
+    cfg = configuration()
+    if windows_listener_records(cfg['socks_port']):
+        raise GatewayError('SOCKS port is already in use on Windows; no listener was changed.')
+    creation = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
+    command = [sys.executable, ROOT/'scripts'/'loopback_forwarder.py', '--port', str(cfg['socks_port']),
+               '--distro', WSL_DISTRO, '--pid-file', FORWARDER_PID]
+    with open(os.devnull, 'r+b') as null:
+        subprocess.Popen([str(value) for value in command], stdin=null, stdout=null, stderr=null,
+                         close_fds=True, creationflags=creation)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        validation = listener_result()
+        if validation['listener_present'] and validation['loopback_only']:
+            return
+        time.sleep(0.25)
+    stop_forwarder()
+    raise GatewayError('Windows loopback-only SOCKS forwarder did not start.')
+
+def ready(backend='docker'):
+    selected = backend_name(backend)
+    state = wsl_status_data() if selected == 'wsl' else read_json(STATE/'status.json')
+    return bool(state.get('ready')) and socks_available()
+
+def cleanup_auth(backend='docker'):
     # SSD/APFS cannot promise forensic secure erasure; permissions and short
     # lifetime are the protection. No secret is intentionally backed up.
     if AUTH.is_symlink() or AUTH.exists():
         AUTH.unlink()
+    if backend == 'wsl' and WSL_DISTRO in wsl_names():
+        wsl_manager('cleanup-auth', check=False, timeout=20)
 
-def stop_internal(keep_auth=False):
+def stop_internal(keep_auth=False, backend='docker'):
+    selected = backend_name(backend)
+    if selected == 'wsl':
+        stop_forwarder()
+        result = wsl_manager('stop', check=False, timeout=35) if WSL_DISTRO in wsl_names() else None
+        if not keep_auth:
+            cleanup_auth('wsl')
+        if result is not None and result.returncode:
+            raise GatewayError('Managed WSL services could not be stopped; credentials cleanup was still attempted.')
+        return
     result = compose('down','--timeout','8','--remove-orphans',check=False,timeout=35)
     if not keep_auth:
-        cleanup_auth()
+        cleanup_auth('docker')
     if result.returncode:
         raise GatewayError('Docker could not remove gateway containers. Credentials were removed unless this is a controlled transport comparison.')
 
-def prompt_credentials():
-    cleanup_auth()
+def prompt_credentials(backend='docker'):
+    cleanup_auth(backend)
     if not sys.stdin.isatty():
         raise GatewayError('Credentials require an interactive terminal; run ' + CLI +
                            ' start there. Do not send credentials in chat.')
@@ -306,8 +617,15 @@ def prompt_credentials():
     password = getpass.getpass('VPN password: ')
     if not username or not password or any(c in username+password for c in '\r\n\x00'):
         raise GatewayError('Empty or multiline credentials are not supported.')
-    private_write(AUTH, username+'\n'+password+'\n')
+    secret = username+'\n'+password+'\n'
     del username, password
+    if backend == 'wsl':
+        result = wsl_manager('put-auth', input=secret, check=False, timeout=20)
+        secret = ''
+        if result.returncode:
+            raise GatewayError('Credentials could not be transferred to the protected WSL runtime file.')
+    else:
+        private_write(AUTH, secret)
 
 def derive_config(source, expected=None):
     """Only known profile directives are accepted; embedded keys are opaque data."""
@@ -388,7 +706,7 @@ def derive_config(source, expected=None):
                'pull-filter ignore "block-outside-dns"', 'pull-filter ignore "register-dns"']
     return '\n'.join(output)+'\n'
 
-def prepare(transport):
+def prepare(transport, backend='docker'):
     cfg = configuration()
     if transport not in cfg['transports']:
         raise GatewayError('Unknown transport: ' + transport)
@@ -405,9 +723,39 @@ def prepare(transport):
     private_write(RUNTIME/'client.ovpn', derive_config(
         (ROOT/'config'/profile['profile_file']).read_text(), profile))
     private_write(RUNTIME/'selected-transport',transport+'\n')
+    if backend_name(backend) == 'wsl':
+        result = wsl_manager('put-profile', input=(RUNTIME/'client.ovpn').read_text(),
+                             check=False, timeout=20)
+        if result.returncode:
+            raise GatewayError('Derived OpenVPN profile could not be transferred to the managed WSL distro.')
 
-def start_transport(transport, timeout=100):
-    prepare(transport)
+def start_transport(transport, timeout=100, backend='docker'):
+    selected = backend_name(backend)
+    prepare(transport, selected)
+    if selected == 'wsl':
+        wsl_manager('start', timeout=40)
+        print('Waiting for '+transport.upper()+' OpenVPN initialization and tun0 in managed WSL2...',flush=True)
+        deadline = time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            data = wsl_status_data()
+            if data.get('hook_error') or (data.get('initialization_completed') and not data.get('routes_ready')):
+                print('OpenVPN initialized, but the managed WSL network hook failed.', flush=True)
+                logs('wsl')
+                return False
+            if data.get('ready') and data.get('tun_exists'):
+                start_forwarder()
+                for _ in range(24):
+                    if socks_available() and listener_result()['loopback_only']:
+                        print('Connected: Initialization Sequence Completed; WSL tun0 verified; '
+                              'Windows loopback-only SOCKS5 handshake passed.', flush=True)
+                        return True
+                    time.sleep(0.5)
+                print('WSL VPN initialized, but loopback-only SOCKS did not become available.', flush=True)
+                return False
+            time.sleep(2)
+        print('WSL transport did not become ready. Sanitized events:', flush=True)
+        logs('wsl')
+        return False
     compose('up','-d','--no-build','vpn',timeout=40)
     print('Waiting for '+transport.upper()+' OpenVPN initialization and tun0...',flush=True)
     deadline = time.monotonic()+timeout
@@ -436,13 +784,40 @@ def start_transport(transport, timeout=100):
     logs()
     return False
 
-def logs():
+def logs(backend='docker'):
+    if backend_name(backend) == 'wsl':
+        result = wsl('/usr/bin/tail', '-n', '45', '/var/lib/isolated-openvpn-gateway/state/safe.log',
+                     check=False, timeout=20)
+        print(result.stdout.strip() if result.returncode == 0 and result.stdout.strip()
+              else 'No sanitized WSL VPN events yet.')
+        return
     path = STATE/'safe.log'
     print('\n'.join(path.read_text().splitlines()[-45:]) if path.exists() else 'No sanitized VPN events yet.')
 
-def status():
+def status(backend='docker'):
+    selected_backend = backend_name(backend)
+    if selected_backend == 'wsl':
+        data = wsl_status_data()
+        transport = (RUNTIME/'selected-transport').read_text().strip() if (RUNTIME/'selected-transport').exists() else 'none'
+        print('Backend: wsl')
+        print('Managed distro:', WSL_DISTRO, 'owned' if data.get('owned') else 'unavailable')
+        print('WSL networking mode:', wsl_backend.networking_mode(Path.home()/'.wslconfig'))
+        print('Service manager:', 'systemd' if data.get('systemd') else 'safe fallback')
+        print('Selected transport:',transport)
+        print('OpenVPN initialization completed:',bool(data.get('initialization_completed')))
+        print('Gateway ready:',bool(data.get('ready')) and socks_available())
+        print('tun0 exists:',bool(data.get('tun_exists')))
+        print('Pushed DNS present:',bool(data.get('dns_pushed')))
+        if not data.get('dns_pushed'):
+            print('Corporate DNS: server did not push DNS; no address was invented.')
+        print('Windows SOCKS5 handshake:',socks_available())
+        print('Windows listener:', json.dumps(listener_result(), ensure_ascii=False))
+        if data.get('hook_error'):
+            print('Network hook error:',data['hook_error'])
+        return
     engine()
     data = read_json(STATE/'status.json')
+    print('Backend: docker')
     transport = (RUNTIME/'selected-transport').read_text().strip() if (RUNTIME/'selected-transport').exists() else 'none'
     print('Selected transport:',transport)
     print(compose('ps','--all',check=False).stdout.strip())
@@ -467,19 +842,47 @@ def safe_target(value):
         raise GatewayError('Supply a private http(s) URL without credentials, query or fragment.')
     return u
 
-def validation(target=None):
+def validation(target=None, backend='docker'):
+    selected = backend_name(backend)
     before=read_json(ROOT/'validation'/'before.json')
     after=network_snapshot()
     result=compare_host(before,after) if before else {}
-    result['initialization_completed']=bool(read_json(STATE/'status.json').get('ready'))
+    state=wsl_status_data() if selected == 'wsl' else read_json(STATE/'status.json')
+    result['backend']=selected
+    result['initialization_completed']=bool(state.get('ready'))
     result['socks_handshake']=socks_available()
-    cid=container_id('vpn')
-    if cid:
+    if selected == 'wsl':
+        listeners = listener_result()
+        result['loopback_publish_only'] = all(listeners.get(key) is True for key in (
+            'listener_present','loopback_only','ipv4_wildcard_absent','ipv6_wildcard_absent'))
+        route=wsl('/sbin/ip','route','get','1.1.1.1','uid','10000',check=False,timeout=15)
+        result['proxy_route_tun0']='dev tun0' in route.stdout
+        result['tun0_exists']=wsl('/sbin/ip','link','show','tun0',check=False,timeout=15).returncode == 0
+        chain=wsl('/usr/sbin/iptables','-C','OUTPUT','-m','owner','--uid-owner','10000',
+                  '-j','IOVG_WSL_PROXY',check=False,timeout=15)
+        result['fail_closed_firewall_installed']=chain.returncode == 0
+        outer=state.get('outer_interface')
+        if outer:
+            forced=wsl('/usr/sbin/runuser','-u','proxyuser','--','/usr/bin/curl','--interface',outer,
+                       '--noproxy','*','-fsS','--connect-timeout','3','--max-time','4',
+                       'http://1.1.1.1/',check=False,timeout=8)
+            result['forced_eth0_blocked']=forced.returncode != 0
+        else:
+            result['forced_eth0_blocked']=False
+    else:
+        cid=container_id('vpn')
+        if not cid:
+            cid=None
+    if selected == 'docker' and cid:
         details=json.loads(docker('inspect',cid).stdout)[0]
         cfg = configuration()
         bindings=details['HostConfig']['PortBindings'].get('1080/tcp',[])
-        result['loopback_publish_only']=bindings == [
-            {'HostIp':cfg['socks_host'],'HostPort':str(cfg['socks_port'])}]
+        docker_loopback=bindings == [{'HostIp':cfg['socks_host'],'HostPort':str(cfg['socks_port'])}]
+        if host.IS_WINDOWS:
+            listeners=listener_result()
+            docker_loopback = docker_loopback and all(listeners.get(key) is True for key in (
+                'listener_present','loopback_only','ipv4_wildcard_absent','ipv6_wildcard_absent'))
+        result['loopback_publish_only']=docker_loopback
         r=docker('exec',cid,'ip','route','get','1.1.1.1','uid','10000',check=False)
         result['proxy_route_tun0']='dev tun0' in r.stdout
         result['tun0_exists']=docker('exec',cid,'ip','link','show','tun0',check=False).returncode == 0
@@ -488,7 +891,6 @@ def validation(target=None):
         r=docker('exec','--user','10000:10000',cid,'curl','--interface','eth0','--noproxy','*',
                  '-fsS','--connect-timeout','3','--max-time','4','http://1.1.1.1/',check=False,timeout=8)
         result['forced_eth0_blocked']=r.returncode != 0
-    state=read_json(STATE/'status.json')
     result['private_dns_pushed']=bool(state.get('dns_pushed'))
     if state.get('dns'):
         result['private_dns_via_socks']=any(socks_dns_query(address) for address in state['dns'])
@@ -506,6 +908,8 @@ def validation(target=None):
                 'host_static_routes_preserved','host_public_route_preserved',
                 'host_outer_ip_preserved','global_git_proxy_preserved','initialization_completed',
                 'socks_handshake','loopback_publish_only','proxy_route_tun0','tun0_exists','forced_eth0_blocked')
+    if selected == 'wsl':
+        critical += ('fail_closed_firewall_installed',)
     result['passed'] = all(result.get(key) is True for key in critical)
     if state.get('dns'):
         result['passed'] = result['passed'] and result['private_dns_via_socks']
@@ -517,11 +921,13 @@ def validation(target=None):
     print(json.dumps(result,indent=2))
     return result
 
-def failure_test():
-    cid=container_id('vpn')
-    if not cid or not ready():
+def failure_test(backend='docker'):
+    selected = backend_name(backend)
+    cid=container_id('vpn') if selected == 'docker' else None
+    if (selected == 'docker' and not cid) or not ready(selected):
         raise GatewayError('Failure test needs a live verified connection first.')
-    dns=read_json(STATE/'status.json').get('dns',[])
+    state=wsl_status_data() if selected == 'wsl' else read_json(STATE/'status.json')
+    dns=state.get('dns',[])
     if dns:
         server=next((address for address in dns if socks_dns_query(address)),None)
         if not server:
@@ -531,52 +937,83 @@ def failure_test():
         canary=lambda: public_ip(proxy=True) is not None
         if not canary():
             raise GatewayError('Failure test aborted: a successful SOCKS request is required as a positive control.')
-    docker('exec',cid,'python3','-c',"import os,signal,pathlib; os.kill(int(pathlib.Path('/run/openvpn.pid').read_text()),signal.SIGTERM)")
+    if selected == 'wsl':
+        wsl_manager('stop-vpn', timeout=25)
+    else:
+        docker('exec',cid,'python3','-c',"import os,signal,pathlib; os.kill(int(pathlib.Path('/run/openvpn.pid').read_text()),signal.SIGTERM)")
     time.sleep(3)
     blocked=not canary()
     outer=public_ip()
-    stopped=docker('inspect','--format','{{.State.Running}}',cid,check=False).stdout.strip() == 'false'
-    socks=container_id('socks')
-    tun_absent=bool(socks) and docker('exec',socks,'ip','link','show','tun0',check=False).returncode != 0
+    if selected == 'wsl':
+        stopped=not wsl_status_data().get('ready')
+        # Both observations must come from the same nested namespace that runs
+        # OpenVPN and Dante.  The WSL distribution's root namespace is a
+        # different network environment and would make this evidence invalid.
+        tun_absent=not wsl_status_data().get('tun_exists')
+        forced=wsl_manager('proxy-outer-test', check=False, timeout=10)
+        firewall_blocked=forced.returncode != 0
+    else:
+        stopped=docker('inspect','--format','{{.State.Running}}',cid,check=False).stdout.strip() == 'false'
+        socks=container_id('socks')
+        tun_absent=bool(socks) and docker('exec',socks,'ip','link','show','tun0',check=False).returncode != 0
+        firewall_blocked=True
     result={'openvpn_terminated':stopped,'tun0_absent':tun_absent,
             'proxy_request_verified_before_stop':True,
-            'socks_after_vpn_stop_blocked':blocked,'host_still_online':bool(outer)}
+            'socks_after_vpn_stop_blocked':blocked,'firewall_forced_outer_blocked':firewall_blocked,
+            'host_still_online':bool(outer)}
+    if selected == 'wsl':
+        wsl_manager('start', timeout=40)
+        deadline=time.monotonic()+100
+        while time.monotonic()<deadline and not wsl_status_data().get('ready'):
+            time.sleep(2)
+        if not wsl_status_data().get('ready'):
+            result['state_restored']=False
+        else:
+            if not listener_result()['listener_present']:
+                start_forwarder()
+            result['state_restored']=socks_available()
     print(json.dumps(result,indent=2),flush=True)
     return result
 
-def compare_transports():
-    stop_internal()
-    before=preflight()
-    prompt_credentials()
+def compare_transports(backend='docker'):
+    selected_backend = backend_name(backend)
+    stop_internal(backend=selected_backend)
+    before=preflight(selected_backend)
+    try:
+        prompt_credentials(selected_backend)
+    except BaseException:
+        stop_internal(backend=selected_backend)
+        raise
     results={}
     selected=None
     try:
         transports = list(configuration()['transports'])
         for transport in transports:
-            ok=start_transport(transport)
-            row={'connected':ok, 'openvpn_initialized':bool(read_json(STATE/'status.json').get('initialization_completed')),
-                 'gateway_state':read_json(STATE/'status.json')}
+            ok=start_transport(transport, backend=selected_backend)
+            current_state=wsl_status_data() if selected_backend == 'wsl' else read_json(STATE/'status.json')
+            row={'connected':ok, 'openvpn_initialized':bool(current_state.get('initialization_completed')),
+                 'gateway_state':current_state}
             if ok:
-                row['validation']=validation(preferences().get('test_url'))
-                row['failure_test']=failure_test()
+                row['validation']=validation(preferences().get('test_url'), selected_backend)
+                row['failure_test']=failure_test(selected_backend)
             row['usable'] = ok and row.get('validation',{}).get('passed',False) and all(row.get('failure_test',{}).values())
             row['events']=(STATE/'safe.log').read_text() if (STATE/'safe.log').exists() else ''
             results[transport]=row
             private_write(ROOT/'validation'/'transports.json',json.dumps(results,indent=2))
-            stop_internal(keep_auth=True)
+            stop_internal(keep_auth=True, backend=selected_backend)
         selected=next((x for x in transports if results[x]['usable']),None)
         if selected:
-            if not start_transport(selected):
+            if not start_transport(selected, backend=selected_backend):
                 selected=None
                 raise GatewayError('Chosen transport failed its repeat connection test.')
             prefs=preferences(); prefs['default_transport']=selected; save_preferences(prefs)
-            validation(prefs.get('test_url'))
+            validation(prefs.get('test_url'), selected_backend)
             print('Selected default: '+selected+'; the other profile remains available.',flush=True)
         else:
             raise GatewayError('Neither transport passed all gateway checks; sanitized transport evidence saved.')
     finally:
-        if not selected or not ready():
-            stop_internal()
+        if not selected or not ready(selected_backend):
+            stop_internal(backend=selected_backend)
 
 def repository_ssh_config(host, user_config='~/.ssh/config', system_config='/etc/ssh/ssh_config',
                           proxy_host=None, proxy_port=None, proxy_command=None):
@@ -674,15 +1111,22 @@ def uninstall():
     marker = read_json(ROOT/'installation.json')
     if marker.get('project') != PROJECT or ROOT != expected_root:
         raise GatewayError('Installation ownership check failed; refusing to change anything.')
-    stop_internal()
+    selected = active_backend()
+    stop_internal(backend=selected)
     for record in read_json(ROOT/'git-changes.json',[]):
         r=run(['git','-C',record['repo'],'config','--local','--get',record['key']],check=False)
         if r.stdout.strip() == record['value']:
             run(['git','-C',record['repo'],'config','--local','--unset-all',record['key']])
         elif r.returncode == 0:
             raise GatewayError('Repository configuration changed since installation; preserve gateway and review rollback manually.')
-    for image in (IMAGE,SOCKS_IMAGE):
-        docker('image','rm',image,check=False)
+    marker = read_json(ROOT/'installation.json')
+    if marker.get('wsl_created_by_project'):
+        if input('Full uninstall must remove the project-owned managed WSL distro. Type REMOVE WSL: ') != 'REMOVE WSL':
+            raise GatewayError('Full uninstall cancelled; the managed distro and host installation were preserved.')
+        uninstall_wsl_backend(confirm=False)
+    if Path(DOCKER).is_file():
+        for image in (IMAGE,SOCKS_IMAGE):
+            docker('image','rm',image,check=False)
     profile=host.browser_root()
     delete_profile=profile.exists() and input('Also delete the separate private browser profile? Type DELETE PROFILE: ') == 'DELETE PROFILE'
     names = [CLI, BROWSER_CLI]
@@ -712,12 +1156,15 @@ def usage():
         names = '|'.join(configuration()['transports'])
     except GatewayError:
         names = 'TRANSPORT'
-    print(CLI+' start ['+names+'] | stop | restart ['+names+'] | status | logs | test [URL]\n'
-          '            compare-transports | git-configure [repo] | build | uninstall')
+    print(CLI+' install --backend wsl|docker\n'
+          '            start [TRANSPORT] [--backend docker|wsl] | stop | restart [TRANSPORT]\n'
+          '            status | logs | test [URL] | compare-transports [--backend docker|wsl]\n'
+          '            backend set docker|wsl | git-configure [repo] | build | uninstall [--backend wsl]\n'
+          'Configured transports: '+names)
 
 def main():
     os.umask(0o077)
-    action=sys.argv[1] if len(sys.argv)>1 else 'status'
+    action, positionals, explicit_backend = parse_cli(sys.argv[1:])
     if action in ('--help','-h','help'):
         usage()
         return 0
@@ -730,31 +1177,70 @@ def main():
     with host.maybe_lifecycle_lock(ROOT/'.lock', action not in ('status','logs','test')):
         if action in ('start','restart'):
             cfg = configuration()
-            selected=sys.argv[2] if len(sys.argv)>2 else preferences().get('default_transport',cfg['default_transport'])
+            if len(positionals) > 1:
+                raise GatewayError('Usage: '+CLI+' '+action+' [TRANSPORT] [--backend docker|wsl]')
+            selected_backend=active_backend(explicit_backend) if action == 'restart' else backend_name(explicit_backend)
+            selected=positionals[0] if positionals else preferences().get('default_transport',cfg['default_transport'])
             if selected not in cfg['transports']:
                 raise GatewayError('Usage: '+CLI+' start ['+'|'.join(cfg['transports'])+']')
-            if action == 'start' and ready():
-                print('Already connected. Use '+CLI+' restart to switch sessions.'); status(); return
-            stop_internal(); preflight(); prompt_credentials()
+            if action == 'start' and ready(selected_backend):
+                print('Already connected. Use '+CLI+' restart to switch sessions.'); status(selected_backend); return
+            stop_internal(backend=selected_backend)
             try:
-                if not start_transport(selected):
+                preflight(selected_backend)
+                prompt_credentials(selected_backend)
+                if not start_transport(selected, backend=selected_backend):
                     raise GatewayError('VPN not ready. See '+CLI+' logs; try another configured transport.')
+                private_write(RUNTIME/'active-backend', selected_backend+'\n')
             finally:
-                if not ready():
-                    stop_internal()
+                if not ready(selected_backend):
+                    stop_internal(backend=selected_backend)
         elif action == 'stop':
-            stop_internal()
-            for name in ('client.ovpn','selected-transport'):
+            if positionals:
+                raise GatewayError('Usage: '+CLI+' stop')
+            selected_backend=active_backend(explicit_backend)
+            stop_internal(backend=selected_backend)
+            for name in ('client.ovpn','selected-transport','active-backend'):
                 (RUNTIME/name).unlink(missing_ok=True)
             print('Gateway stopped; ephemeral credentials removed.')
-        elif action == 'status': status()
-        elif action == 'logs': logs()
+        elif action == 'status': status(active_backend(explicit_backend))
+        elif action == 'logs': logs(active_backend(explicit_backend))
         elif action == 'test':
-            return 0 if validation(sys.argv[2] if len(sys.argv)>2 else preferences().get('test_url')).get('passed') else 1
-        elif action == 'compare-transports': compare_transports()
-        elif action == 'git-configure': configure_git(sys.argv[2] if len(sys.argv)>2 else os.getcwd())
-        elif action == 'build': engine(); compose('build',capture=False,timeout=600)
-        elif action == 'uninstall': delete_after_unlock = uninstall()
+            if len(positionals) > 1:
+                raise GatewayError('Usage: '+CLI+' test [URL]')
+            return 0 if validation(positionals[0] if positionals else preferences().get('test_url'),
+                                   active_backend(explicit_backend)).get('passed') else 1
+        elif action == 'compare-transports':
+            if positionals: raise GatewayError('Usage: '+CLI+' compare-transports [--backend docker|wsl]')
+            selected_backend=backend_name(explicit_backend)
+            compare_transports(selected_backend)
+            private_write(RUNTIME/'active-backend', selected_backend+'\n')
+        elif action == 'git-configure':
+            if len(positionals) > 1: raise GatewayError('Usage: '+CLI+' git-configure [repo]')
+            configure_git(positionals[0] if positionals else os.getcwd())
+        elif action == 'backend':
+            if len(positionals) != 2 or positionals[0] != 'set':
+                raise GatewayError('Usage: '+CLI+' backend set docker|wsl')
+            selected_backend=backend_name(positionals[1])
+            prefs=preferences(); prefs['backend']=selected_backend; save_preferences(prefs)
+            print('Saved backend:', selected_backend, '(running sessions were not changed).')
+        elif action == 'install':
+            if positionals or explicit_backend is None:
+                raise GatewayError('Usage: '+CLI+' install --backend docker|wsl')
+            install_backend(explicit_backend)
+        elif action == 'build':
+            if explicit_backend not in (None,'docker') or positionals:
+                raise GatewayError('Image build is available only for the docker backend.')
+            engine(); compose('build',capture=False,timeout=600)
+        elif action == 'uninstall':
+            if positionals:
+                raise GatewayError('Usage: '+CLI+' uninstall [--backend wsl]')
+            if explicit_backend:
+                if explicit_backend != 'wsl':
+                    raise GatewayError('Backend-only uninstall is supported for the project-owned WSL distro only.')
+                uninstall_wsl_backend()
+            else:
+                delete_after_unlock = uninstall()
         else:
             usage()
             return 2
@@ -772,11 +1258,12 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         if len(sys.argv)>1 and sys.argv[1] in ('start','restart','compare-transports'):
             with contextlib.suppress(Exception):
-                stop_internal()
+                _action, _values, _explicit = parse_cli(sys.argv[1:])
+                stop_internal(backend=backend_name(_explicit) if _explicit else active_backend())
             print('\nCancelled; credentials removed.',file=sys.stderr)
         else:
             print('\nCancelled.',file=sys.stderr)
         sys.exit(130)
-    except (GatewayError, subprocess.TimeoutExpired, BlockingIOError) as exc:
+    except (GatewayError, subprocess.TimeoutExpired, BlockingIOError, OSError) as exc:
         print('ERROR:',str(exc),file=sys.stderr)
         sys.exit(1)

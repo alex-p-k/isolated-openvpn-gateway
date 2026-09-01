@@ -81,6 +81,19 @@ def powershell_executable(environ=None):
     return 'powershell.exe'
 
 
+def wsl_executable(environ=None, system=None):
+    environ = os.environ if environ is None else environ
+    system = SYSTEM if system is None else system
+    if system != 'Windows':
+        return 'wsl.exe'
+    found = shutil.which('wsl.exe')
+    if found:
+        return found
+    if environ.get('SystemRoot'):
+        return str(Path(environ['SystemRoot'])/'System32'/'wsl.exe')
+    return 'wsl.exe'
+
+
 def browser_candidates(home=None, environ=None, system=None):
     home = Path.home() if home is None else Path(home)
     environ = os.environ if environ is None else environ

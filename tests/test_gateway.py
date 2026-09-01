@@ -117,6 +117,14 @@ class Tests(unittest.TestCase):
             _,endpoint,port,protocol=vpn.endpoint_config(text)
         self.assertEqual((endpoint,port,protocol),('192.0.2.44',443,'tcp'))
 
+    def test_http_proxy_hostname_is_resolved_and_pinned_for_control_connection(self):
+        text=PROFILE.replace('http-proxy 192.0.2.80 443','http-proxy proxy.example.com 443')
+        with patch.object(vpn.socket,'getaddrinfo',return_value=[
+                (vpn.socket.AF_INET,vpn.socket.SOCK_STREAM,6,'',('192.0.2.80',0))]):
+            rendered,endpoint,port,protocol=vpn.endpoint_config(text)
+        self.assertIn('http-proxy 192.0.2.80 443',rendered)
+        self.assertEqual((endpoint,port,protocol),('192.0.2.80',443,'tcp'))
+
     def test_config_supports_custom_transport_name_and_socks_port(self):
         value=(ROOT/'gateway.example.toml').read_text().replace(
             'default_transport = "udp"','default_transport = "primary"').replace(

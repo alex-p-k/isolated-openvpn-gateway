@@ -48,30 +48,35 @@ class InstallerTests(unittest.TestCase):
 
     def test_install_private_files_and_generated_launchers(self):
         root = installer.install_files(ROOT, self.target_home, self.profiles, Path(sys.executable),
-                                       CONFIG_BYTES, CONFIG)
+                                       CONFIG_BYTES, CONFIG, system='Darwin', environ={})
         for folder in (root, root/'config', root/'runtime'):
-            self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(folder.is_dir())
+            if os.name != 'nt':
+                self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
         self.assertEqual((root/'gateway.toml').read_bytes(), CONFIG_BYTES)
-        self.assertEqual((root/'gateway.toml').stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':
+            self.assertEqual((root/'gateway.toml').stat().st_mode & 0o777, 0o600)
         for kind, data in self.profiles.items():
             copied = root/'config'/CONFIG['transports'][kind]['profile_file']
             self.assertEqual(copied.read_bytes(), data)
-            self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+            if os.name != 'nt':
+                self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
         self.assertEqual(list((root/'runtime').iterdir()), [])
         for name in ('vpn-gateway', 'vpn-browser'):
             link = self.target_home/'.local/bin'/name
             self.assertTrue(link.is_symlink())
-            result = subprocess.run([str(link), '--help'], capture_output=True, text=True, timeout=8)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            if os.name != 'nt':
+                result = subprocess.run([str(link), '--help'], capture_output=True, text=True, timeout=8)
+                self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.target_home/'.local/share/isolated-openvpn-browser').exists())
 
     def test_existing_installation_not_overwritten(self):
         root = installer.install_files(ROOT, self.target_home, self.profiles, Path(sys.executable),
-                                       CONFIG_BYTES, CONFIG)
+                                       CONFIG_BYTES, CONFIG, system='Darwin', environ={})
         before = (root/'installation.json').read_bytes()
         with self.assertRaises(installer.InstallError):
             installer.install_files(ROOT, self.target_home, self.profiles, Path(sys.executable),
-                                    CONFIG_BYTES, CONFIG)
+                                    CONFIG_BYTES, CONFIG, system='Darwin', environ={})
         self.assertEqual((root/'installation.json').read_bytes(), before)
 
     def test_existing_command_is_preserved(self):
@@ -80,14 +85,14 @@ class InstallerTests(unittest.TestCase):
         path.write_text('owned by someone else')
         with self.assertRaises(installer.InstallError):
             installer.install_files(ROOT, self.target_home, self.profiles, Path(sys.executable),
-                                    CONFIG_BYTES, CONFIG)
+                                    CONFIG_BYTES, CONFIG, system='Darwin', environ={})
         self.assertEqual(path.read_text(), 'owned by someone else')
 
     def test_failed_install_rolls_back_only_new_root(self):
         with patch.object(installer, 'write_private', side_effect=OSError('test failure')):
             with self.assertRaises(OSError):
                 installer.install_files(ROOT, self.target_home, self.profiles, Path(sys.executable),
-                                        CONFIG_BYTES, CONFIG)
+                                        CONFIG_BYTES, CONFIG, system='Darwin', environ={})
         self.assertFalse((self.target_home/'.local/share/isolated-openvpn-gateway').exists())
 
     def test_profiles_unchanged_and_proxy_is_required(self):
@@ -173,6 +178,8 @@ class GitTests(unittest.TestCase):
         self.assertFalse((gateway.ROOT/'config').exists())
 
     def test_ssh_config_preserves_other_host_and_blocks_master_reuse(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX OpenSSH Include permission semantics are covered on macOS/Linux')
         user_config = self.base/'user ssh.conf'
         user_config.write_text('Host personal.example.invalid\n    HostName 203.0.113.44\n    Port 2222\n')
         system_config = self.base/'system.conf'
@@ -180,7 +187,10 @@ class GitTests(unittest.TestCase):
         config = self.base/'generated.conf'
         config.write_text(gateway.repository_ssh_config('corp.example.invalid', user_config, system_config))
         def settings(host):
-            output = gateway.run(['/usr/bin/ssh', '-G', '-F', config, host]).stdout
+            ssh = shutil.which('ssh')
+            if not ssh:
+                self.skipTest('OpenSSH client is unavailable')
+            output = gateway.run([ssh, '-G', '-F', config, host]).stdout
             return dict(line.split(' ', 1) for line in output.splitlines() if ' ' in line)
         personal = settings('personal.example.invalid')
         corporate = settings('corp.example.invalid')

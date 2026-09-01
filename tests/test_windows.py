@@ -2,6 +2,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,7 @@ class HostTests(unittest.TestCase):
                          Path('C:/Users/Test User/AppData/Local/IsolatedOpenVPNGateway/bin'))
 
     def test_windows_browser_candidates_cover_chrome_chromium_and_edge(self):
-        values = [str(x) for x in host.browser_candidates(
+        values = [str(x).replace('\\','/') for x in host.browser_candidates(
             environ={'ProgramFiles':'C:/Program Files',
                      'ProgramFiles(x86)':'C:/Program Files (x86)',
                      'LOCALAPPDATA':'C:/Users/A/AppData/Local'}, system='Windows')]
@@ -286,7 +287,10 @@ class WindowsGatewayTests(unittest.TestCase):
             proxy_command=proxy)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'ssh.conf'; path.write_text(text)
-            result = subprocess.run(['/usr/bin/ssh','-G','-F',path,'git.private.example'],
+            ssh = shutil.which('ssh')
+            if not ssh:
+                self.skipTest('OpenSSH client is unavailable')
+            result = subprocess.run([ssh,'-G','-F',path,'git.private.example'],
                                     capture_output=True,text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('socks_connect.py', result.stdout)
