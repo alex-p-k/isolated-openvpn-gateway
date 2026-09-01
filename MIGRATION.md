@@ -1,6 +1,6 @@
 # Migration from `corp-vpn-gateway`
 
-The generic installation uses new paths and commands, so the known-working legacy installation can remain untouched during acceptance:
+The generic installation uses new paths and commands, so the known-working macOS legacy installation can remain untouched during acceptance:
 
 ```text
 legacy:  ~/.local/share/corp-vpn-gateway       corp-vpn / corp-browser
@@ -21,3 +21,5 @@ Both gateways publish a loopback SOCKS port, so never run them at the same time 
 Do not copy legacy runtime credentials, derived profiles, logs, validation state or browser cookies. Supply the original IT profiles to the new installer so it can validate and copy them afresh.
 
 The generic installer does not edit or remove the legacy installation. If `corp-vpn` already exists, `--legacy-aliases` intentionally refuses to overwrite it.
+
+There is no automatic legacy-to-Windows migration. On Windows, use the original IT-issued profiles and a fresh private `gateway.toml`; do not copy macOS runtime state, credentials, browser data or validation logs.

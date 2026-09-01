@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Host lifecycle. This program never starts OpenVPN on macOS."""
+"""Host lifecycle. This program never starts OpenVPN on the host OS."""
 import contextlib
-import fcntl
 import getpass
 import hashlib
 import ipaddress
@@ -11,7 +10,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import signal
 import socket
 import struct
 import subprocess
@@ -19,21 +17,18 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from gateway_config import (BROWSER_CLI, BROWSER_DIR, CLI, INSTALL_DIR, PROJECT,
-                            SOCKS_IMAGE, VPN_IMAGE, ConfigError, load_config)
+from gateway_config import (BROWSER_CLI, CLI, PROJECT, SOCKS_IMAGE, VPN_IMAGE,
+                            ConfigError, load_config)
+import host
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / 'runtime'
 STATE = RUNTIME / 'state'
 AUTH = RUNTIME / 'auth'
 PREFS = ROOT / 'settings.json'
-DOCKER = next((str(p) for p in (
-    Path(shutil.which('docker') or '/usr/local/bin/docker'),
-    Path.home()/'.docker/bin/docker',
-    Path('/Applications/Docker.app/Contents/Resources/bin/docker'),
-    Path.home()/'Applications/Docker.app/Contents/Resources/bin/docker',
-) if p.is_file() and os.access(p,os.X_OK)), '/usr/local/bin/docker')
-CURL = '/usr/bin/curl'
+DOCKER = host.docker_executable()
+CURL = host.curl_executable()
+POWERSHELL = host.powershell_executable()
 IP_URL = 'https://api.ipify.org'
 IMAGE = VPN_IMAGE
 ENV = {k:v for k,v in os.environ.items() if k not in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH')}
@@ -68,13 +63,12 @@ def compose(*args, **kwargs):
                 '--project-directory', ROOT, '-f', ROOT/'compose.yaml', *args], env=env, **kwargs)
 
 def private_write(path, text, mode=0o600):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise GatewayError('Refusing symlink: '+str(path))
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'w') as f:
-        f.write(text)
-    path.chmod(mode)
+    try:
+        if not path.parent.exists():
+            host.private_directory(path.parent, parents=True)
+        host.private_write(path, text, mode=mode)
+    except OSError as exc:
+        raise GatewayError(str(exc)) from None
 
 def read_json(path, default=None):
     try:
@@ -153,22 +147,86 @@ def public_ip(proxy=False):
     except ValueError:
         return None
 
+def powershell(command):
+    return [POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command]
+
+def windows_network_commands():
+    """Return read-only PowerShell diagnostics with stable, machine-readable output."""
+    convert = '; ConvertTo-Json -Compress -Depth 6 -InputObject @($x)'
+    return {
+        'dns': powershell("$x=Get-DnsClientServerAddress -AddressFamily IPv4 | "
+                          "Sort-Object InterfaceIndex | Select-Object InterfaceIndex,InterfaceAlias,ServerAddresses" + convert),
+        'routes': powershell("$x=Get-NetRoute -AddressFamily IPv4 | Where-Object {$_.Protocol -ne 'Local'} | "
+                             "Sort-Object DestinationPrefix,InterfaceIndex,NextHop | "
+                             "Select-Object DestinationPrefix,NextHop,InterfaceIndex,InterfaceAlias,RouteMetric,Protocol" + convert),
+        'default': powershell("$x=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | "
+                              "Sort-Object RouteMetric,InterfaceMetric | "
+                              "Select-Object InterfaceIndex,InterfaceAlias,NextHop,RouteMetric,InterfaceMetric" + convert),
+        'public_route': powershell("$x=Find-NetRoute -RemoteIPAddress 1.1.1.1 | "
+                                   "Select-Object InterfaceIndex,InterfaceAlias,NextHop,RouteMetric" + convert),
+        'adapters': powershell("$x=Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+                               "Sort-Object ifIndex | Select-Object Name,InterfaceDescription,ifIndex,Status" + convert),
+        'git_global_proxy': ['git','config','--global','--get-regexp',
+                             r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$'],
+    }
+
 def network_snapshot():
-    commands = {'dns':['scutil','--dns'], 'routes':['netstat','-rn','-f','inet'],
-                'default':['route','-n','get','default'], 'public_route':['route','-n','get','1.1.1.1'],
-                'git_global_proxy':['git','config','--global','--get-regexp', r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$']}
+    commands = windows_network_commands() if host.IS_WINDOWS else {
+        'dns':['scutil','--dns'], 'routes':['netstat','-rn','-f','inet'],
+        'default':['route','-n','get','default'], 'public_route':['route','-n','get','1.1.1.1'],
+        'git_global_proxy':['git','config','--global','--get-regexp',
+                            r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$']}
     data = {'captured_at': time.time(), 'public_ip':public_ip()}
     for key, cmd in commands.items():
         r = run(cmd, check=False)
         data[key] = {'code':r.returncode, 'stdout':r.stdout, 'stderr':r.stderr}
-    data['static_routes'] = [' '.join(line.split()[:4]) for line in data['routes']['stdout'].splitlines()
-                             if len(line.split()) >= 4 and 'S' in line.split()[2]]
-    data['public_route_signature'] = '\n'.join(line.strip() for line in data['public_route']['stdout'].splitlines()
-                                               if re.match(r'\s*(destination|mask|gateway|interface):',line))
+    data['diagnostics_ok'] = all(data[key]['code'] == 0 for key in ('dns','routes','default','public_route'))
+    if host.IS_WINDOWS:
+        data['static_routes'] = data['routes']['stdout'].strip()
+        data['public_route_signature'] = data['public_route']['stdout'].strip()
+        data['outer_adapters'] = data['adapters']['stdout'].strip()
+    else:
+        data['static_routes'] = [' '.join(line.split()[:4]) for line in data['routes']['stdout'].splitlines()
+                                 if len(line.split()) >= 4 and 'S' in line.split()[2]]
+        data['public_route_signature'] = '\n'.join(line.strip() for line in data['public_route']['stdout'].splitlines()
+                                                   if re.match(r'\s*(destination|mask|gateway|interface):',line))
     return data
 
+def windows_outer_route_matches(snapshot, matchers):
+    """Require the selected public route to use a configured, connected adapter."""
+    try:
+        adapters = json.loads(snapshot['adapters']['stdout'])
+        routes = json.loads(snapshot['public_route']['stdout'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not isinstance(adapters, list):
+        adapters = [adapters]
+    if not isinstance(routes, list):
+        routes = [routes]
+    wanted = []
+    for adapter in adapters:
+        if not isinstance(adapter, dict) or str(adapter.get('Status', '')).casefold() != 'up':
+            continue
+        identity = (str(adapter.get('Name', '')) + '\n' +
+                    str(adapter.get('InterfaceDescription', ''))).casefold()
+        if any(value.casefold() in identity for value in matchers):
+            try:
+                wanted.append(int(adapter.get('ifIndex', adapter.get('InterfaceIndex'))))
+            except (TypeError, ValueError):
+                pass
+    for route in routes:
+        if isinstance(route, dict):
+            try:
+                if int(route.get('InterfaceIndex', route.get('ifIndex'))) in wanted:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    return False
+
 def compare_host(before, after):
-    return {'host_dns_preserved': before['dns'] == after['dns'],
+    return {'host_diagnostics_available':before.get('diagnostics_ok') is True and after.get('diagnostics_ok') is True,
+            'host_dns_preserved': before['dns'] == after['dns'],
+            'host_default_route_preserved':before['default'] == after['default'],
             'host_static_routes_preserved':before['static_routes'] == after['static_routes'],
             'host_public_route_preserved':before['public_route_signature'] == after['public_route_signature'],
             'host_outer_ip_preserved':bool(before['public_ip']) and before['public_ip'] == after['public_ip'],
@@ -188,11 +246,27 @@ def images():
 def preflight():
     engine(); images()
     cfg = configuration()
+    tun = docker('run','--rm','--cap-drop','ALL','--device','/dev/net/tun:/dev/net/tun',
+                 '--security-opt','no-new-privileges','--entrypoint','test',IMAGE,'-c','/dev/net/tun',
+                 check=False,timeout=20)
+    if tun.returncode:
+        raise GatewayError('Docker Desktop cannot expose /dev/net/tun to a Linux container. Inner OpenVPN was not started.')
     before = network_snapshot()
-    prefix = re.escape(cfg['outer_interface_prefix'])
-    if cfg['require_outer_vpn'] and not re.search(r'interface:\s+' + prefix + r'\d+', before['public_route']['stdout']):
-        raise GatewayError('No active outer VPN route on ' + cfg['outer_interface_prefix'] +
-                           '*. Connect the required outer VPN before starting.')
+    if not before.get('diagnostics_ok'):
+        raise GatewayError('Host route/DNS diagnostics are unavailable. Inner OpenVPN was not started.')
+    if cfg['require_outer_vpn']:
+        if host.IS_WINDOWS:
+            needles = cfg['windows_outer_adapter_contains']
+            if not needles:
+                raise GatewayError('Windows deployment must configure windows_outer_adapter_contains before startup.')
+            if not windows_outer_route_matches(before, needles):
+                raise GatewayError('The selected Windows public route does not use a configured outer VPN adapter. '
+                                   'Inner OpenVPN was not started.')
+        else:
+            prefix = re.escape(cfg['outer_interface_prefix'])
+            if not re.search(r'interface:\s+' + prefix + r'\d+', before['public_route']['stdout']):
+                raise GatewayError('No active outer VPN route on ' + cfg['outer_interface_prefix'] +
+                                   '*. Connect the required outer VPN before starting.')
     result = docker('run','--rm','--cap-drop','ALL','--read-only','--security-opt','no-new-privileges',
                     '--entrypoint','curl',IMAGE,'-4','--noproxy','*','-fsS','--max-time','15',IP_URL, timeout=25)
     container_ip = result.stdout.strip()
@@ -318,8 +392,10 @@ def prepare(transport):
     cfg = configuration()
     if transport not in cfg['transports']:
         raise GatewayError('Unknown transport: ' + transport)
-    STATE.mkdir(mode=0o755,parents=True,exist_ok=True)
-    STATE.chmod(0o755)
+    if not STATE.exists():
+        host.private_directory(STATE, parents=True)
+    if not host.IS_WINDOWS:
+        STATE.chmod(0o755)
     for name in ('status.json','status.new','safe.log'):
         p=STATE/name
         if p.exists() or p.is_symlink():
@@ -421,12 +497,13 @@ def validation(target=None):
         cfg = configuration()
         r=run([CURL,'--proxy','socks5h://%s:%d' % (cfg['socks_host'], cfg['socks_port']),
                '--noproxy','','--connect-timeout','8','--max-time','20',
-               '--silent','--show-error','--output','/dev/null','--write-out','%{http_code}',u.geturl()],check=False,timeout=25)
+               '--silent','--show-error','--output',os.devnull,'--write-out','%{http_code}',u.geturl()],check=False,timeout=25)
         result['private_http_status']=r.stdout
         result['private_target_connected']=r.returncode == 0
     else:
         result['private_target_connected']='NOT TESTED: no private hostname supplied'
-    critical = ('host_dns_preserved','host_static_routes_preserved','host_public_route_preserved',
+    critical = ('host_diagnostics_available','host_dns_preserved','host_default_route_preserved',
+                'host_static_routes_preserved','host_public_route_preserved',
                 'host_outer_ip_preserved','global_git_proxy_preserved','initialization_completed',
                 'socks_handshake','loopback_publish_only','proxy_route_tun0','tun0_exists','forced_eth0_blocked')
     result['passed'] = all(result.get(key) is True for key in critical)
@@ -502,20 +579,44 @@ def compare_transports():
             stop_internal()
 
 def repository_ssh_config(host, user_config='~/.ssh/config', system_config='/etc/ssh/ssh_config',
-                          proxy_host=None, proxy_port=None):
+                          proxy_host=None, proxy_port=None, proxy_command=None):
     # Reset Host scope before Include. Otherwise unrelated hosts would lose
     # the user's existing settings. Disable reuse of a possible direct master.
     cfg = configuration()
     proxy_host = proxy_host or cfg['socks_host']
     proxy_port = proxy_port or cfg['socks_port']
+    if proxy_command is None:
+        proxy_command = '/usr/bin/nc -X 5 -x '+proxy_host+':'+str(proxy_port)+' %h %p'
+    user_config = str(user_config).replace('\\','/')
+    system_config = str(system_config).replace('\\','/')
     return ('Host '+host+'\n'
-            '    ProxyCommand /usr/bin/nc -X 5 -x '+proxy_host+':'+str(proxy_port)+' %h %p\n'
+            '    ProxyCommand '+proxy_command+'\n'
             '    CanonicalizeHostname no\n'
             '    ControlMaster no\n'
             '    ControlPath none\n'
             '    ControlPersist no\n\n'
             'Host *\n    Include '+json.dumps(str(user_config),ensure_ascii=False)+'\n'
             'Host *\n    Include '+json.dumps(str(system_config),ensure_ascii=False)+'\n')
+
+def repository_ssh_settings(remote_host, config_path):
+    if host.IS_WINDOWS:
+        user_ssh, system_ssh = host.ssh_config_paths()
+        python_path = str(Path(sys.executable).resolve()).replace('\\','/')
+        helper_path = str((ROOT/'scripts'/'socks_connect.py').resolve()).replace('\\','/')
+        try:
+            host.ensure_windows_command_paths(python_path, helper_path, user_ssh, system_ssh, config_path)
+        except OSError as exc:
+            raise GatewayError(str(exc)) from None
+        cfg = configuration()
+        proxy_command = ('"'+python_path+'" "'+helper_path+'" '+cfg['socks_host']+' '+
+                         str(cfg['socks_port'])+' %h %p')
+        ssh_path = host.ssh_executable().replace('\\','/')
+        private_config = str(config_path).replace('\\','/')
+        value='"'+ssh_path+'" -F "'+private_config+'"'
+        text=repository_ssh_config(remote_host, user_ssh, system_ssh, proxy_command=proxy_command)
+        return value, text
+    return ('/usr/bin/ssh -F '+shlex.quote(str(config_path)),
+            repository_ssh_config(remote_host))
 
 def configure_git(repo):
     repo=Path(repo).expanduser().resolve()
@@ -538,9 +639,9 @@ def configure_git(repo):
         cfg = configuration()
         key='http.'+url+'.proxy'; value='socks5h://%s:%d' % (cfg['socks_host'],cfg['socks_port'])
     else:
-        host=u.hostname if u.scheme == 'ssh' else (re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url).group(1)
+        remote_host=u.hostname if u.scheme == 'ssh' else (re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url).group(1)
                 if re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url) else None)
-        if not host or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*',host) or u.password:
+        if not remote_host or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*',remote_host) or u.password:
             raise GatewayError('Unsupported remote URL')
         if os.environ.get('GIT_SSH_COMMAND') or os.environ.get('GIT_SSH'):
             raise GatewayError('An environment SSH override exists; review it before configuring the proxy.')
@@ -548,8 +649,7 @@ def configure_git(repo):
         config=ROOT/'config'/('ssh-repo-'+hashlib.sha256(str(repo).encode()).hexdigest()[:16]+'.conf')
         if os.path.lexists(config):
             raise GatewayError('A private SSH configuration already exists; refusing to overwrite it.')
-        value='/usr/bin/ssh -F '+shlex.quote(str(config))
-        config_text=repository_ssh_config(host)
+        value, config_text = repository_ssh_settings(remote_host, config)
     scope=['--local'] if key != 'core.sshCommand' else []
     previous=run(['git','-C',repo,'config',*scope,'--get-all',key],check=False)
     if previous.returncode == 0:
@@ -563,12 +663,14 @@ def configure_git(repo):
     records=read_json(ROOT/'git-changes.json',[])
     records.append({'repo':str(repo),'key':key,'value':value,'backup':str(backup)})
     private_write(ROOT/'git-changes.json',json.dumps(records,indent=2))
-    print('Configured repository only. Read-only test: '+shlex.join(['git','-C',str(repo),'ls-remote',remote]))
+    test_command=['git','-C',str(repo),'ls-remote',remote]
+    rendered=subprocess.list2cmdline(test_command) if host.IS_WINDOWS else shlex.join(test_command)
+    print('Configured repository only. Read-only test: '+rendered)
 
 def uninstall():
     if input('Remove only '+PROJECT+' and its launchers? Type REMOVE: ') != 'REMOVE':
         return
-    expected_root = Path.home()/INSTALL_DIR
+    expected_root = host.install_root()
     marker = read_json(ROOT/'installation.json')
     if marker.get('project') != PROJECT or ROOT != expected_root:
         raise GatewayError('Installation ownership check failed; refusing to change anything.')
@@ -581,15 +683,16 @@ def uninstall():
             raise GatewayError('Repository configuration changed since installation; preserve gateway and review rollback manually.')
     for image in (IMAGE,SOCKS_IMAGE):
         docker('image','rm',image,check=False)
-    profile=Path.home()/BROWSER_DIR
+    profile=host.browser_root()
     delete_profile=profile.exists() and input('Also delete the separate private browser profile? Type DELETE PROFILE: ') == 'DELETE PROFILE'
     names = [CLI, BROWSER_CLI]
     if marker.get('legacy_aliases'):
         names += ['corp-vpn','corp-browser']
-    for name in names:
-        p=Path.home()/'.local/bin'/name
-        if p.is_symlink() and p.resolve().is_relative_to(ROOT):
-            p.unlink()
+    if not host.IS_WINDOWS:
+        for name in names:
+            p=Path.home()/'.local/bin'/name
+            if p.is_symlink() and p.resolve().is_relative_to(ROOT):
+                p.unlink()
     marker=read_json(ROOT/'installation.json')
     if marker.get('project') != PROJECT or ROOT != expected_root:
         raise GatewayError('Installation ownership check failed; refusing deletion.')
@@ -597,8 +700,12 @@ def uninstall():
         if not (profile/'.isolated-openvpn-gateway-owned').is_file():
             raise GatewayError('Browser profile ownership marker is absent; refusing deletion.')
         shutil.rmtree(profile)
+    if host.IS_WINDOWS:
+        # main() removes ROOT after the Windows lock handle is closed.
+        return True
     shutil.rmtree(ROOT)
     print('Gateway removed. Docker Desktop, outer VPN, repositories and global network/Git settings were preserved.')
+    return False
 
 def usage():
     try:
@@ -614,16 +721,13 @@ def main():
     if action in ('--help','-h','help'):
         usage()
         return 0
-    if read_json(ROOT/'installation.json').get('project') != PROJECT or ROOT != Path.home()/INSTALL_DIR:
-        raise GatewayError('Run install.py first, then use ~/.local/bin/'+CLI+
+    if read_json(ROOT/'installation.json').get('project') != PROJECT or ROOT != host.install_root():
+        command = str(host.command_directory(ROOT)/((CLI+'.cmd') if host.IS_WINDOWS else CLI))
+        raise GatewayError('Run install.py first, then use '+command+
                            '; do not run lifecycle commands from the source archive.')
     RUNTIME.mkdir(mode=0o700,exist_ok=True)
-    with (ROOT/'.lock').open('w') as lock:
-        if action not in ('status','logs','test'):
-            try:
-                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise GatewayError('Another lifecycle command is still running.')
+    delete_after_unlock = False
+    with host.maybe_lifecycle_lock(ROOT/'.lock', action not in ('status','logs','test')):
         if action in ('start','restart'):
             cfg = configuration()
             selected=sys.argv[2] if len(sys.argv)>2 else preferences().get('default_transport',cfg['default_transport'])
@@ -650,10 +754,16 @@ def main():
         elif action == 'compare-transports': compare_transports()
         elif action == 'git-configure': configure_git(sys.argv[2] if len(sys.argv)>2 else os.getcwd())
         elif action == 'build': engine(); compose('build',capture=False,timeout=600)
-        elif action == 'uninstall': uninstall()
+        elif action == 'uninstall': delete_after_unlock = uninstall()
         else:
             usage()
             return 2
+    if delete_after_unlock:
+        with contextlib.suppress(ValueError):
+            if Path.cwd().resolve().is_relative_to(ROOT):
+                os.chdir(Path.home())
+        shutil.rmtree(ROOT)
+        print('Gateway removed. Docker Desktop, outer VPN, repositories and global network/Git settings were preserved.')
     return 0
 
 if __name__ == '__main__':
@@ -667,6 +777,6 @@ if __name__ == '__main__':
         else:
             print('\nCancelled.',file=sys.stderr)
         sys.exit(130)
-    except (GatewayError, subprocess.TimeoutExpired) as exc:
+    except (GatewayError, subprocess.TimeoutExpired, BlockingIOError) as exc:
         print('ERROR:',str(exc),file=sys.stderr)
         sys.exit(1)

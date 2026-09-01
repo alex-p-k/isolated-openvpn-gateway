@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the generic isolated OpenVPN-to-SOCKS5 gateway on macOS."""
+"""Install the isolated OpenVPN-to-SOCKS5 gateway on macOS or Windows."""
 import argparse
 import hashlib
 import importlib.util
@@ -15,14 +15,16 @@ import time
 
 PACKAGE = Path(__file__).resolve().parent
 PACKAGE_FILES = (
-    'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'MIGRATION.md', 'install.py',
+    'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'MIGRATION.md', 'WINDOWS.md', 'install.py',
     'gateway.example.toml', 'compose.yaml', 'Dockerfile.vpn', 'Dockerfile.socks',
-    '.dockerignore', '.gitignore', 'scripts/gateway_config.py', 'scripts/gateway.py',
-    'scripts/vpn.py', 'scripts/socks.py', 'scripts/sockd.conf', 'scripts/browser.py',
-    'tests/test_gateway.py', 'tests/test_install.py', 'tools/build_release.py',
+    '.dockerignore', '.gitignore', 'scripts/gateway_config.py', 'scripts/host.py',
+    'scripts/gateway.py', 'scripts/vpn.py', 'scripts/socks.py', 'scripts/sockd.conf',
+    'scripts/browser.py', 'scripts/socks_connect.py', 'tests/test_gateway.py',
+    'tests/test_install.py', 'tests/test_windows.py', 'tools/build_release.py',
 )
 INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
     'install.py', 'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',
+    'tests/test_windows.py',
 ))
 
 
@@ -88,6 +90,10 @@ def config_module(package):
     return source_module(package, 'handoff_gateway_config', 'scripts/gateway_config.py')
 
 
+def host_module(package):
+    return source_module(package, 'handoff_host', 'scripts/host.py')
+
+
 def load_profiles(paths, gateway, configuration):
     """Validate profile data without executing directives or printing private content."""
     result = {}
@@ -106,10 +112,12 @@ def load_profiles(paths, gateway, configuration):
     return result
 
 
-def requirements(gateway):
+def requirements(gateway, hostlib):
     import platform
-    if platform.system() != 'Darwin' or platform.machine() not in ('arm64', 'x86_64'):
-        raise InstallError('This installer targets macOS arm64/x86_64 only.')
+    system = platform.system()
+    architectures = {'Darwin': ('arm64', 'x86_64'), 'Windows': ('AMD64', 'ARM64', 'x86_64')}
+    if system not in architectures or platform.machine() not in architectures[system]:
+        raise InstallError('This installer targets macOS arm64/x86_64 and Windows AMD64/ARM64 only.')
     if sys.version_info < (3, 11):
         raise InstallError('Python 3.11 or newer is required. No Python installation was attempted.')
     if not Path(gateway.DOCKER).is_file():
@@ -119,6 +127,9 @@ def requirements(gateway):
         ('Compose', [gateway.DOCKER, '--context', 'desktop-linux', 'compose', 'version', '--short']),
         ('Git', ['git', '--version']),
     ]
+    if system == 'Windows':
+        checks.append(('PowerShell', [hostlib.powershell_executable(), '-NoLogo', '-NoProfile',
+                                      '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()']))
     for name, args in checks:
         try:
             value = subprocess.run(args, env=gateway.ENV, capture_output=True, text=True, timeout=12)
@@ -127,35 +138,34 @@ def requirements(gateway):
         if value.returncode:
             raise InstallError(name + ' is unavailable; no system settings were changed.')
         print(name + ': available')
-    print('macOS architecture: ' + platform.machine() + '; Python: ' + platform.python_version())
-    browser_paths = (
-        Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
-        Path('/Applications/Chromium.app/Contents/MacOS/Chromium'),
-        Path.home() / 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        Path.home() / 'Applications/Chromium.app/Contents/MacOS/Chromium',
-    )
-    print('Browser: available' if any(p.is_file() for p in browser_paths)
-          else 'Browser: install Chrome/Chromium before using vpn-browser (Git does not require it).')
+    print(system + ' architecture: ' + platform.machine() + '; Python: ' + platform.python_version())
+    print('Browser: available' if any(p.is_file() for p in hostlib.browser_candidates())
+          else 'Browser: install Chrome/Chromium/Edge before using vpn-browser (Git does not require it).')
 
 
-def write_private(path, data, mode=0o600):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'wb') as stream:
-        stream.write(data)
-    path.chmod(mode)
+def write_private(path, data, mode=0o600, hostlib=None, system=None):
+    hostlib = host_module(PACKAGE) if hostlib is None else hostlib
+    if not path.parent.exists():
+        hostlib.private_directory(path.parent, parents=True, system=system)
+    hostlib.private_write(path, data, mode=mode, exclusive=True, system=system)
 
 
 def install_files(package, target_home, profiles, python_executable, config_bytes, configuration,
-                  legacy_aliases=False):
+                  legacy_aliases=False, system=None, environ=None):
     """Install files only; do not run Docker, OpenVPN or any host network command."""
+    import platform
     configlib = config_module(package)
-    root = target_home / configlib.INSTALL_DIR
-    launch_dir = target_home / '.local/bin'
+    hostlib = host_module(package)
+    system = platform.system() if system is None else system
+    environ = os.environ if environ is None else environ
+    root = hostlib.install_root(target_home, environ, system)
+    if system == 'Windows':
+        hostlib.ensure_windows_command_paths(root, target_home, python_executable)
+    launch_dir = hostlib.command_directory(root, target_home, system)
     commands = [configlib.CLI, configlib.BROWSER_CLI]
     if legacy_aliases:
         commands += ['corp-vpn', 'corp-browser']
-    links = [launch_dir / name for name in commands]
+    links = [] if system == 'Windows' else [launch_dir / name for name in commands]
     for path in (root, *links):
         if os.path.lexists(path):
             raise InstallError('Refusing to overwrite an existing installation or command: ' + str(path))
@@ -166,18 +176,20 @@ def install_files(package, target_home, profiles, python_executable, config_byte
             if candidate.is_symlink():
                 raise InstallError('Refusing a symlink in the installation path: ' + str(candidate))
     root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    root.mkdir(mode=0o700)
     created_links = []
     try:
+        hostlib.private_directory(root, system=system)
         for name in INSTALL_FILES:
-            write_private(root / name, safe_source(package, name).read_bytes())
+            write_private(root / name, safe_source(package, name).read_bytes(), hostlib=hostlib, system=system)
         for name in ('config', 'runtime', 'backups', 'validation', 'bin'):
-            (root / name).mkdir(mode=0o700, exist_ok=True)
-        write_private(root / 'gateway.toml', config_bytes)
+            hostlib.private_directory(root / name, exist_ok=True, system=system)
+        write_private(root / 'gateway.toml', config_bytes, hostlib=hostlib, system=system)
         for transport, data in profiles.items():
-            write_private(root / 'config' / configuration['transports'][transport]['profile_file'], data)
+            write_private(root / 'config' / configuration['transports'][transport]['profile_file'], data,
+                          hostlib=hostlib, system=system)
         write_private(root / 'settings.json', (json.dumps({
-            'default_transport': configuration['default_transport']}, indent=2) + '\n').encode())
+            'default_transport': configuration['default_transport']}, indent=2) + '\n').encode(),
+                      hostlib=hostlib, system=system)
         metadata = {
             'project': configlib.PROJECT,
             'deployment_id': configuration['id'],
@@ -189,23 +201,36 @@ def install_files(package, target_home, profiles, python_executable, config_byte
             },
             'legacy_aliases': bool(legacy_aliases),
         }
-        write_private(root / 'installation.json', (json.dumps(metadata, indent=2) + '\n').encode())
-        for name, script in ((configlib.CLI, 'gateway.py'), (configlib.BROWSER_CLI, 'browser.py')):
-            launcher = '#!/bin/sh\nexec ' + shlex.quote(str(python_executable)) + ' ' + \
-                       shlex.quote(str(root / 'scripts' / script)) + ' "$@"\n'
-            write_private(root / 'bin' / name, launcher.encode(), 0o700)
-        if legacy_aliases:
-            for alias, target in (('corp-vpn', configlib.CLI), ('corp-browser', configlib.BROWSER_CLI)):
-                (root / 'bin' / alias).symlink_to(root / 'bin' / target)
-        launch_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        for link in links:
-            link.symlink_to(root / 'bin' / link.name)
-            created_links.append(link)
+        write_private(root / 'installation.json', (json.dumps(metadata, indent=2) + '\n').encode(),
+                      hostlib=hostlib, system=system)
+        launchers = ((configlib.CLI, 'gateway.py'), (configlib.BROWSER_CLI, 'browser.py'))
+        if system == 'Windows':
+            for name, script in launchers:
+                write_private(root/'bin'/(name+'.cmd'), hostlib.batch_launcher(python_executable, script),
+                              hostlib=hostlib, system=system)
+            if legacy_aliases:
+                for alias, script in (('corp-vpn','gateway.py'),('corp-browser','browser.py')):
+                    write_private(root/'bin'/(alias+'.cmd'), hostlib.batch_launcher(python_executable, script),
+                                  hostlib=hostlib, system=system)
+        else:
+            for name, script in launchers:
+                launcher = '#!/bin/sh\nPYTHONDONTWRITEBYTECODE=1 exec ' + shlex.quote(str(python_executable)) + ' ' + \
+                           shlex.quote(str(root / 'scripts' / script)) + ' "$@"\n'
+                write_private(root / 'bin' / name, launcher.encode(), 0o700,
+                              hostlib=hostlib, system=system)
+            if legacy_aliases:
+                for alias, target in (('corp-vpn', configlib.CLI), ('corp-browser', configlib.BROWSER_CLI)):
+                    (root / 'bin' / alias).symlink_to(root / 'bin' / target)
+            launch_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for link in links:
+                link.symlink_to(root / 'bin' / link.name)
+                created_links.append(link)
     except BaseException:
         for link in created_links:
             if link.is_symlink() and link.resolve().is_relative_to(root):
                 link.unlink()
-        shutil.rmtree(root)
+        if root.exists() and not root.is_symlink():
+            shutil.rmtree(root)
         raise
     return root
 
@@ -234,11 +259,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     sys.dont_write_bytecode = True
-    if os.geteuid() == 0:
-        raise InstallError('Run as your normal macOS user, not sudo/root.')
     verify_manifest(PACKAGE)
     gateway = gateway_module(PACKAGE)
     configlib = config_module(PACKAGE)
+    hostlib = host_module(PACKAGE)
+    elevated = hostlib.is_elevated()
+    if elevated is None:
+        raise InstallError('Cannot verify whether the installer is elevated; nothing was changed.')
+    if elevated:
+        raise InstallError('Run as your normal desktop user, not sudo/root/Administrator.')
     configuration = None
     config_bytes = None
     if args.config:
@@ -262,7 +291,7 @@ def main(argv=None):
         missing = sorted(set(configuration['transports']) - set(paths))
         raise InstallError('Profiles are required for every transport; missing: ' + ', '.join(missing))
     profiles = load_profiles(paths, gateway, configuration) if paths else None
-    requirements(gateway)
+    requirements(gateway, hostlib)
     if profiles:
         print('Profiles: structurally compatible with gateway.toml; originals unchanged.')
     if args.check:
@@ -271,11 +300,18 @@ def main(argv=None):
     if not configuration or not profiles:
         raise InstallError('Supply --config and either --profiles-dir or one --profile per transport.')
     root = install_files(PACKAGE, Path.home(), profiles, Path(sys.executable).resolve(),
-                         config_bytes, configuration, args.legacy_aliases)
+                         config_bytes, configuration, args.legacy_aliases,
+                         system=hostlib.SYSTEM, environ=os.environ)
     print('Installed: ' + str(root))
     print('No VPN was started; host DNS/routes, global Git and browser profiles were not changed.')
-    print('Next: enable your outer VPN, then run ~/.local/bin/vpn-gateway start')
-    print('If commands are not in PATH, run: export PATH="$HOME/.local/bin:$PATH"')
+    if hostlib.IS_WINDOWS:
+        command = root/'bin'/'vpn-gateway.cmd'
+        print('Next: configure windows_outer_adapter_contains, enable the outer VPN, then run:')
+        print('  "'+str(command)+'" start')
+        print('For this PowerShell window only: $env:Path="'+str(root/'bin')+';$env:Path"')
+    else:
+        print('Next: enable your outer VPN, then run ~/.local/bin/vpn-gateway start')
+        print('If commands are not in PATH, run: export PATH="$HOME/.local/bin:$PATH"')
     return 0
 
 

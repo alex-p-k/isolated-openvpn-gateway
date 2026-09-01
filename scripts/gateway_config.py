@@ -66,7 +66,8 @@ def load_config(path):
     if not isinstance(gateway, dict) or not isinstance(transports, dict) or not transports:
         raise ConfigError('gateway.toml requires [gateway] and at least one [transports.NAME] table.')
     _only(gateway, {'id', 'display_name', 'default_transport', 'dns_canary', 'socks_port',
-                    'require_outer_vpn', 'outer_interface_prefix'}, '[gateway]')
+                    'require_outer_vpn', 'outer_interface_prefix',
+                    'windows_outer_adapter_contains'}, '[gateway]')
     identifier = gateway.get('id')
     if not isinstance(identifier, str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', identifier):
         raise ConfigError('gateway.id must use lowercase letters, digits and hyphens (max 32).')
@@ -87,6 +88,12 @@ def load_config(path):
     interface_prefix = gateway.get('outer_interface_prefix', 'utun')
     if not isinstance(interface_prefix, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9]{0,15}', interface_prefix):
         raise ConfigError('gateway.outer_interface_prefix must be a simple interface prefix.')
+    windows_adapters = gateway.get('windows_outer_adapter_contains', [])
+    if not isinstance(windows_adapters, list) or len(windows_adapters) > 8 or any(
+            not isinstance(value, str) or len(value.strip()) < 3 or len(value) > 80 or
+            any(ord(ch) < 32 for ch in value) for value in windows_adapters):
+        raise ConfigError('gateway.windows_outer_adapter_contains must be a list of 3-80 character strings.')
+    windows_adapters = list(dict.fromkeys(value.strip() for value in windows_adapters))
 
     normalized = {}
     profile_files = set()
@@ -138,5 +145,6 @@ def load_config(path):
         'socks_port': socks_port,
         'require_outer_vpn': require_outer,
         'outer_interface_prefix': interface_prefix,
+        'windows_outer_adapter_contains': windows_adapters,
         'transports': normalized,
     }

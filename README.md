@@ -1,46 +1,49 @@
 # Isolated OpenVPN Gateway
 
-**Isolated OpenVPN Gateway** is a local client-side network gateway for macOS. It runs an inner OpenVPN client inside Docker Desktop and exposes that tunnel as a loopback-only SOCKS5 proxy. It is also accurately described as an **OpenVPN-to-SOCKS5 gateway**.
+**Isolated OpenVPN Gateway** is a local client-side OpenVPN-to-SOCKS5 gateway for macOS and Windows. It runs the private OpenVPN client inside Docker Desktop and publishes that tunnel only as a loopback SOCKS5 proxy.
 
-It is not a VPN server, a system-wide macOS VPN, or a general public proxy.
+It is not a VPN server, a system-wide VPN, or a public proxy.
 
 ```text
-macOS applications selected by the user
+selected host applications
   -> socks5h://127.0.0.1:1080
-  -> Dante in the Docker network namespace
+  -> Docker loopback publication
+  -> Dante (same network namespace as OpenVPN)
   -> tun0 only
   -> private network
 
-all other macOS traffic
+all other host traffic
   -> unchanged host route / optional outer VPN
 ```
 
-The source is company-neutral. Deployment-specific endpoints, transport names, profile filenames, DNS canary and SOCKS port live in a private `gateway.toml`. OpenVPN profiles and credentials are never included in a release archive.
+The source is organization-neutral. Deployment endpoints, transport names, profile filenames, DNS canary and SOCKS port live in a private `gateway.toml`. OpenVPN profiles and credentials are never included in a release archive.
 
 ## Security properties
 
-- OpenVPN runs only in Docker Desktop with `/dev/net/tun` and `NET_ADMIN`; `privileged: true` is not used.
-- Docker publishes only `127.0.0.1:PORT`; the host LAN never receives a listener.
-- Dante binds outbound sockets to `tun0`. UID routing and container firewall rules reject `eth0` fallback if the tunnel disappears.
-- macOS DNS, routes and global Git configuration are not changed.
-- Credentials are requested with hidden terminal input, written to a mode `0600` runtime file, never passed as arguments/environment, and removed on stop/failure/stale start.
-- `.ovpn` files are copied mode `0600`; originals are read-only inputs and are never edited.
-- Profile directives are allowlisted. Script/plugin/management directives are rejected. The exact remote and optional HTTP proxy must match `gateway.toml`.
-- Inline profile blocks are treated as opaque private data. The deployment specifies which security blocks are required.
+- OpenVPN runs only in a Docker Desktop Linux VM with `/dev/net/tun` and `NET_ADMIN`; `privileged: true` is not used.
+- Docker publishes only `127.0.0.1:PORT`; the LAN receives no proxy listener.
+- Dante binds outbound sockets to `tun0`. UID routing and firewall rules reject `eth0` fallback if the tunnel disappears.
+- Host DNS, routes and global Git configuration are read for validation but are never changed.
+- Credentials use hidden terminal input and a short-lived private runtime file. They are never passed in arguments or environment variables and are removed on stop, failure and the next start.
+- Private deployment files use mode `0600` on macOS. Windows files and directories receive a protected NTFS ACL for the current user SID with inherited access removed.
+- Original `.ovpn` files are read-only installer inputs. Profile directives are allowlisted and the exact remote and optional HTTP proxy must match `gateway.toml`.
+- The installer refuses Administrator/root execution, existing install paths, symlinks, malformed manifests and incompatible profiles.
 
 ## Requirements
 
-- macOS on arm64 or x86_64
-- Docker Desktop with the `desktop-linux` engine running
+- macOS arm64/x86_64, or Windows 10/11 AMD64. Windows ARM64 additionally depends on Docker Desktop Arm Early Access.
+- Docker Desktop running **Linux containers** with the `desktop-linux` context
 - Python 3.11 or newer
 - Git
-- Chrome or Chromium only for the optional isolated browser
+- Chrome, Chromium or Microsoft Edge for the optional isolated browser
 
-Docker outbound traffic must use the same public egress as the host. `vpn-gateway start` checks this before sending any credentials to OpenVPN. If Docker bypasses the outer VPN, startup stops.
+On Windows, Docker Desktop's WSL 2 backend is the expected lightweight backend. The Hyper-V Linux backend can also work, but the Linux VM must expose `/dev/net/tun`. Startup tests that device before asking for credentials.
+
+Docker outbound traffic must have the same public egress as the host. When `require_outer_vpn=true`, startup also verifies the selected public route: `utun*` on macOS or a configured connected adapter on Windows. If Docker bypasses the outer VPN, startup stops before OpenVPN authentication.
 
 ## Deployment configuration
 
-Copy `gateway.example.toml` outside the source package and replace only its examples with values from the IT-issued profiles. Keep it private. Each transport has an arbitrary short name; `udp` and `tcp` are conventions, not hardcoded engine choices.
+Copy `gateway.example.toml` outside the source package and replace the examples with values from IT-issued profiles. Keep it private. Transport names are arbitrary; `udp` and `tcp` are conventions.
 
 ```toml
 [gateway]
@@ -50,7 +53,8 @@ default_transport = "udp"
 dns_canary = "internal.example.com"
 socks_port = 1080
 require_outer_vpn = true
-outer_interface_prefix = "utun"
+outer_interface_prefix = "utun" # macOS
+windows_outer_adapter_contains = ["Distinctive VPN adapter name"] # Windows
 
 [transports.udp]
 profile_file = "company-udp.ovpn"
@@ -60,40 +64,44 @@ remote_protocol = "udp4"
 required_inline_blocks = ["ca", "tls-auth"]
 ```
 
-Supported IPv4 client protocols are `udp`, `udp4`, `tcp-client`, and `tcp4-client`. Add `http_proxy_host` and `http_proxy_port` only when the profile itself has the matching `http-proxy` directive. Set `require_outer_vpn = false` only for a deployment that intentionally does not require nesting.
+`windows_outer_adapter_contains` contains one or more distinctive, case-insensitive substrings from the Windows adapter `Name` or `InterfaceDescription`. The public route must use one of the matching interface indexes. See `WINDOWS.md` for the discovery command.
 
-`dns_canary` is a harmless hostname expected to return an A record through pushed private DNS. Do not put credentials, tokens or URLs with query strings in this file.
+Supported IPv4 client protocols are `udp`, `udp4`, `tcp-client`, and `tcp4-client`. Add `http_proxy_host` and `http_proxy_port` only when the profile contains the matching `http-proxy` directive. Set `require_outer_vpn=false` only when nesting is intentionally unnecessary.
+
+`dns_canary` is a harmless private hostname expected to return an A record through pushed private DNS. Do not put credentials, tokens or URLs with query strings in this file.
 
 ## Verify and install
 
-From the extracted release directory:
+From an extracted release on macOS:
 
 ```bash
 shasum -a 256 -c isolated-openvpn-gateway-YYYY-MM-DD.zip.sha256
-python3 install.py --check \
-  --config "/private/path/gateway.toml" \
-  --profiles-dir "/private/path/profiles"
-
-python3 install.py \
-  --config "/private/path/gateway.toml" \
-  --profiles-dir "/private/path/profiles"
+python3 install.py --check --config "/private/path/gateway.toml" --profiles-dir "/private/path/profiles"
+python3 install.py         --config "/private/path/gateway.toml" --profiles-dir "/private/path/profiles"
 ```
 
-`--profiles-dir` resolves each `profile_file` from the TOML. For profiles stored in different directories, repeat `--profile NAME=/path/file.ovpn` once for every configured transport.
+On Windows PowerShell:
+
+```powershell
+Get-FileHash .\isolated-openvpn-gateway-YYYY-MM-DD.zip -Algorithm SHA256
+py -3.11 .\install.py --check --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+py -3.11 .\install.py         --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
+```
+
+`--profiles-dir` resolves each `profile_file` from the TOML. For profiles in different directories, repeat `--profile NAME=PATH` once for every transport.
 
 Installation creates:
 
-```text
-~/.local/share/isolated-openvpn-gateway/
-~/.local/bin/vpn-gateway
-~/.local/bin/vpn-browser
-```
+| Host | Gateway | Commands | Browser profile |
+|---|---|---|---|
+| macOS | `~/.local/share/isolated-openvpn-gateway` | `~/.local/bin/vpn-gateway`, `vpn-browser` | `~/.local/share/isolated-openvpn-browser` |
+| Windows | `%LOCALAPPDATA%\IsolatedOpenVPNGateway` | `...\bin\vpn-gateway.cmd`, `vpn-browser.cmd` | `%LOCALAPPDATA%\IsolatedOpenVPNBrowser` |
 
-It refuses to overwrite existing paths. Optional `--legacy-aliases` creates `corp-vpn` and `corp-browser` aliases only when those names are unused.
+No command is added to a global PATH. Optional `--legacy-aliases` creates `corp-vpn` and `corp-browser` only when those names are unused.
 
 ## Commands
 
-```bash
+```text
 vpn-gateway start                 # configured default transport
 vpn-gateway start TRANSPORT
 vpn-gateway stop
@@ -102,31 +110,32 @@ vpn-gateway status
 vpn-gateway logs
 vpn-gateway test [https://private-host/]
 vpn-gateway compare-transports
-vpn-gateway git-configure /path/to/repository
+vpn-gateway git-configure PATH_TO_REPOSITORY
 vpn-gateway build
 vpn-gateway uninstall
 vpn-browser [https://private-host/]
 ```
 
-`start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route hook succeeds, `tun0` exists and a SOCKS5 handshake passes. `compare-transports` tests every configured transport, including a real fail-closed test, and saves the first fully usable transport as default.
+Use the `.cmd` path or add its directory to the current PowerShell session on Windows. `start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route hook succeeds, `tun0` exists and a SOCKS5 handshake passes. `compare-transports` also performs a real fail-closed test and selects the first fully usable transport.
 
 ## DNS, browser and Git
 
-Pushed `dhcp-option DNS` and search domains are applied only inside the VPN/SOCKS namespace. `socks5h` and the isolated browser resolve target names on the proxy side. macOS system DNS remains untouched. If the server pushes no DNS, the status/report says so rather than inventing an address.
+Pushed `dhcp-option DNS` and search domains are applied only inside the VPN/SOCKS namespace. `socks5h`, the SSH bridge and the isolated browser send target hostnames to the proxy side. Host system DNS remains untouched. If the server pushes no DNS, status reports that fact.
 
-`vpn-browser` uses `~/.local/share/isolated-openvpn-browser`, disables QUIC and non-proxied WebRTC UDP, prevents local target DNS, and has no `direct://` fallback. It never edits the main browser profile.
+`vpn-browser` creates a separate profile, disables QUIC, direct WebRTC UDP, browser DNS-over-HTTPS and local target DNS. It has no `direct://` fallback and never edits the main browser profile.
 
 `vpn-gateway git-configure` changes only the selected repository and remote:
 
 - HTTPS: repository-local `http.<exact-url>.proxy=socks5h://127.0.0.1:PORT`
-- SSH: repository-local `core.sshCommand` with a host-specific private config and `/usr/bin/nc -X 5`
+- SSH on macOS: repository-local `core.sshCommand` plus a host-specific private config and system `nc -X 5`
+- SSH on Windows: repository-local `core.sshCommand` plus a host-specific private config and the bundled Python SOCKS5 stdio bridge
 
-It creates no global Git or SSH proxy. Test with `git -C /path/to/repo ls-remote REMOTE`; a push is unnecessary.
+No global Git or SSH proxy is created. Test with `git -C PATH ls-remote REMOTE`; a push is unnecessary.
 
 ## Validation and rollback
 
-Run `vpn-gateway test` after connecting. It checks host DNS/routes/public egress/global Git preservation, loopback-only publication, `tun0`, UID routing, forced-`eth0` blocking, SOCKS and pushed DNS. Add a real private URL for an application-level connection check.
+Run `vpn-gateway test` after connecting. It checks preservation of host DNS, routes, public egress and global Git settings; loopback-only publication; `tun0`; UID routing; forced-`eth0` blocking; SOCKS; and pushed DNS. Add a real private URL for an application-level connection test.
 
-`vpn-gateway uninstall` removes only the installation-owned containers, image tags, launchers, copied profiles, runtime files and matching repository-local Git changes. The isolated browser profile requires a second explicit confirmation. Docker Desktop, outer VPN software, repositories and global macOS settings remain.
+`vpn-gateway uninstall` removes only installation-owned containers, image tags, launchers, copied profiles, runtime files and matching repository-local Git changes. Deleting the isolated browser profile requires a second confirmation. Docker Desktop, outer VPN software, repositories and global host settings remain.
 
-For moving from the older `corp-vpn-gateway` package, see `MIGRATION.md`. For handing this to another person, see `HANDOFF.md`.
+See `WINDOWS.md` for Windows installation and acceptance, `QUICKSTART.md` for short commands, `HANDOFF.md` for transfer, and `MIGRATION.md` for the older package.

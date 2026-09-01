@@ -6,6 +6,9 @@ dns_canary = "internal.example.com"
 socks_port = 1080
 require_outer_vpn = true
 outer_interface_prefix = "utun"
+# Required on Windows when require_outer_vpn=true. Match part of the connected
+# outer VPN adapter Name or InterfaceDescription from Get-NetAdapter.
+windows_outer_adapter_contains = ["REPLACE-WITH-OUTER-VPN-ADAPTER"]
 
 [transports.udp]
 profile_file = "company-udp.ovpn"

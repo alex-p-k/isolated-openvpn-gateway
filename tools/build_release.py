@@ -25,7 +25,7 @@ def build(package, archive):
     # No directory walk, no config/runtime data, no symlink or metadata export.
     with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_DEFLATED) as out:
         for name, data in entries.items():
-            info = zipfile.ZipInfo('isolated-openvpn-gateway/' + name, date_time=(2026, 8, 30, 0, 0, 0))
+            info = zipfile.ZipInfo('isolated-openvpn-gateway/' + name, date_time=(2026, 9, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = (stat.S_IFREG | 0o600) << 16
             info.compress_type = zipfile.ZIP_DEFLATED

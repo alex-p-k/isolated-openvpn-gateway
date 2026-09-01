@@ -6,11 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-from gateway_config import BROWSER_CLI, BROWSER_DIR, INSTALL_DIR, PROJECT, ConfigError, load_config
+from gateway_config import BROWSER_CLI, PROJECT, ConfigError, load_config
+import host
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PROFILE = Path.home() / BROWSER_DIR
+PROFILE = host.browser_root()
 
 
 def browser_flags(configuration):
@@ -32,18 +33,15 @@ def main():
         marker = json.loads((ROOT/'installation.json').read_text())
     except (OSError, ValueError):
         pass
-    if marker.get('project') != PROJECT or ROOT != Path.home()/INSTALL_DIR:
-        raise SystemExit('Run install.py first, then use ~/.local/bin/'+BROWSER_CLI+'.')
+    if marker.get('project') != PROJECT or ROOT != host.install_root():
+        command = host.command_directory(ROOT)/(BROWSER_CLI+'.cmd' if host.IS_WINDOWS else BROWSER_CLI)
+        raise SystemExit('Run install.py first, then use '+str(command)+'.')
     try:
         configuration = load_config(ROOT/'gateway.toml')
     except ConfigError as exc:
         raise SystemExit(str(exc)) from None
     os.umask(0o077)
-    binaries=['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-              '/Applications/Chromium.app/Contents/MacOS/Chromium',
-              str(Path.home()/'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
-              str(Path.home()/'Applications/Chromium.app/Contents/MacOS/Chromium')]
-    browser=next((x for x in binaries if Path(x).is_file()),None)
+    browser=next((str(x) for x in host.browser_candidates() if x.is_file()),None)
     if not browser:
         raise SystemExit('Google Chrome/Chromium not found; no main browser profile was modified.')
     ownership = PROFILE/'.isolated-openvpn-gateway-owned'
@@ -51,15 +49,22 @@ def main():
         raise SystemExit('Refusing symlink for private browser profile.')
     if PROFILE.exists() and not ownership.exists():
         raise SystemExit('Existing unowned private browser directory; refusing to overwrite.')
-    PROFILE.mkdir(mode=0o700,parents=True,exist_ok=True)
-    PROFILE.chmod(0o700)
-    ownership.touch(mode=0o600)
+    if not PROFILE.exists():
+        host.private_directory(PROFILE, parents=True)
+    elif not host.IS_WINDOWS:
+        PROFILE.chmod(0o700)
+    if not ownership.exists():
+        host.private_write(ownership, b'', exclusive=True)
     urls=sys.argv[1:] or ['about:blank']
     if any(not x.startswith(('https://','http://','about:blank')) for x in urls):
         raise SystemExit('Only http(s) URLs or about:blank are accepted; additional browser flags are not accepted.')
+    process_args = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if host.IS_WINDOWS:
+        process_args['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        process_args['start_new_session'] = True
     subprocess.Popen([browser,'--user-data-dir='+str(PROFILE),*browser_flags(configuration),*urls],
-                     stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+                     **process_args)
     print('Private browser: separate profile; SOCKS5 only; no direct fallback.')
 
 
