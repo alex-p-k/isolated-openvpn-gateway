@@ -56,7 +56,7 @@ class PureWslTests(unittest.TestCase):
     def test_transport_comparison_rechecks_outer_path_before_next_vpn(self):
         with patch.object(gateway, 'backend_name', return_value='wsl'), \
              patch.object(gateway, 'stop_internal') as stop, \
-             patch.object(gateway, 'preflight', side_effect=[{}, gateway.GatewayError('outer unavailable')]) as preflight, \
+             patch.object(gateway, 'preflight', side_effect=[{}, {}, gateway.GatewayError('outer unavailable')]) as preflight, \
              patch.object(gateway, 'prompt_credentials') as credentials, \
              patch.object(gateway, 'configuration', return_value={'transports':{'udp':{},'tcp':{}}}), \
              patch.object(gateway, 'start_transport', return_value=False) as start, \
@@ -64,7 +64,7 @@ class PureWslTests(unittest.TestCase):
              patch.object(gateway, 'private_write'):
             with self.assertRaisesRegex(gateway.GatewayError, 'outer unavailable'):
                 gateway.compare_transports('wsl')
-        self.assertEqual(preflight.call_count, 2)
+        self.assertEqual(preflight.call_count, 3)
         credentials.assert_called_once_with('wsl')
         start.assert_called_once_with('udp', backend='wsl')
         self.assertEqual(stop.call_args.kwargs, {'backend':'wsl'})

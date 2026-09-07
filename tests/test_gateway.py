@@ -330,7 +330,7 @@ class TransportComparisonTests(unittest.TestCase):
         self.calls['start_transport'].assert_not_called()
 
     def test_next_preflight_failure_keeps_previous_result_and_failed_stage(self):
-        self.calls['preflight'].side_effect = [{}, gateway.GatewayError('SYNTHETIC-PRIVATE-ENDPOINT')]
+        self.calls['preflight'].side_effect = [{}, {}, gateway.GatewayError('SYNTHETIC-PRIVATE-ENDPOINT')]
         with self.assertRaises(gateway.GatewayError):
             gateway.compare_transports('wsl')
         report = self.assert_aborted('transport_preflight')
@@ -341,7 +341,7 @@ class TransportComparisonTests(unittest.TestCase):
         self.calls['start_transport'].assert_called_once_with('udp', backend='wsl')
 
     def test_final_preflight_failure_prevents_repeat_connection(self):
-        self.calls['preflight'].side_effect = [{}, {}, gateway.GatewayError('outer mismatch')]
+        self.calls['preflight'].side_effect = [{}, {}, {}, gateway.GatewayError('outer mismatch')]
         with self.assertRaises(gateway.GatewayError):
             gateway.compare_transports('wsl')
         self.assert_aborted('final_preflight')
@@ -380,7 +380,7 @@ class TransportComparisonTests(unittest.TestCase):
         self.assertFalse(report['cleanup_attempted'])
         self.assertEqual(report['phase'], 'complete')
         self.calls['save_preferences'].assert_called_once_with({'backend': 'docker', 'default_transport': 'udp'})
-        self.assertEqual(self.calls['preflight'].call_count, 3)
+        self.assertEqual(self.calls['preflight'].call_count, 4)
         self.assertEqual(self.calls['validation'].call_count, 3)
         self.calls['stop_internal'].assert_called_with(keep_auth=True, backend='wsl')
 
@@ -393,6 +393,117 @@ class TransportComparisonTests(unittest.TestCase):
         self.assertTrue(self.saved['comparison.json']['completed'])
         self.calls['wsl_status_data'].assert_not_called()
         self.calls['stop_internal'].assert_called_with(keep_auth=True, backend='docker')
+
+    def test_outer_path_change_during_credentials_blocks_first_transport(self):
+        self.calls['preflight'].side_effect = [{}, gateway.GatewayError('outer mismatch')]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('transport_preflight')
+        self.assertEqual(report['transport'], 'udp')
+        self.calls['prompt_credentials'].assert_called_once_with('wsl')
+        self.calls['start_transport'].assert_not_called()
+        self.calls['failure_test'].assert_not_called()
+        self.assertFalse(self.saved['transports.json']['udp']['connected'])
+
+    def test_comparison_rechecks_after_prompt_and_before_first_start(self):
+        events = []
+        self.calls['preflight'].side_effect = lambda backend: events.append('preflight') or {}
+        self.calls['prompt_credentials'].side_effect = lambda backend: events.append('credentials')
+        self.calls['start_transport'].side_effect = lambda *args, **kwargs: events.append('start') or True
+        gateway.compare_transports('wsl')
+        self.assertEqual(events[:4], ['preflight', 'credentials', 'preflight', 'start'])
+
+
+class InteractiveStartPreflightTests(unittest.TestCase):
+    """Synthetic credentials and lifecycle mocks; no network changes."""
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.root = pathlib.Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.auth = self.root/'auth'
+        stack.enter_context(patch.object(gateway, 'ROOT', self.root))
+        stack.enter_context(patch.object(gateway, 'RUNTIME', self.root/'runtime'))
+        stack.enter_context(patch('builtins.print'))
+        stack.enter_context(patch.object(gateway.host, 'installation_root_matches', return_value=True))
+        stack.enter_context(patch.object(gateway.host, 'maybe_lifecycle_lock',
+                                         side_effect=lambda *args: contextlib.nullcontext()))
+        defaults = {
+            'parse_cli': ('start', [], 'wsl'), 'read_json': {'project': gateway.PROJECT},
+            'configuration': {'transports': {'udp': {}}, 'default_transport': 'udp'},
+            'preferences': {}, 'backend_name': 'wsl', 'active_backend': 'wsl',
+            'ready': False, 'preflight': {}, 'prompt_credentials': None,
+            'start_transport': True, 'stop_internal': None, 'private_write': None,
+        }
+        self.calls = {name: stack.enter_context(patch.object(gateway, name, return_value=value))
+                      for name, value in defaults.items()}
+        stack.enter_context(patch.object(gateway, 'run', side_effect=AssertionError('Unexpected real command')))
+        self.events = []
+        def prompt(backend):
+            self.events.append('credentials')
+            self.auth.write_text('synthetic-test-user\nsynthetic-test-password\n')
+        def stop(**kwargs):
+            self.events.append('stop')
+            self.auth.unlink(missing_ok=True)
+        self.calls['prompt_credentials'].side_effect = prompt
+        self.calls['stop_internal'].side_effect = stop
+        self.calls['preflight'].side_effect = lambda backend: self.events.append('preflight') or {}
+        self.calls['start_transport'].side_effect = lambda *args, **kwargs: self.events.append('start') or True
+
+    def test_start_and_restart_recheck_both_backends_after_prompt(self):
+        for action in ('start', 'restart'):
+            for backend, windows in (('wsl', True), ('docker', True), ('docker', False)):
+                with self.subTest(action=action, backend=backend, windows=windows):
+                    self.events.clear()
+                    self.calls['parse_cli'].return_value = (action, [], backend)
+                    self.calls['backend_name'].return_value = backend
+                    self.calls['active_backend'].return_value = backend
+                    self.calls['ready'].side_effect = [False, True] if action == 'start' else [True]
+                    with patch.object(gateway.host, 'IS_WINDOWS', windows):
+                        gateway.main()
+                    self.assertEqual(self.events, ['stop', 'preflight', 'credentials', 'preflight', 'start'])
+                    self.calls['preflight'].assert_called_with(backend)
+                    self.calls['start_transport'].assert_called_with('udp', backend=backend)
+
+    def test_failed_initial_preflight_never_prompts_or_starts(self):
+        self.calls['preflight'].side_effect = gateway.GatewayError('outer unavailable')
+        with self.assertRaises(gateway.GatewayError):
+            gateway.main()
+        self.calls['prompt_credentials'].assert_not_called()
+        self.calls['start_transport'].assert_not_called()
+        self.assertFalse(self.auth.exists())
+
+    def test_failed_post_prompt_preflight_removes_credentials_without_start(self):
+        self.calls['preflight'].side_effect = [{}, gateway.GatewayError('outer mismatch')]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.main()
+        self.calls['prompt_credentials'].assert_called_once_with('wsl')
+        self.calls['start_transport'].assert_not_called()
+        self.assertEqual(self.calls['stop_internal'].call_count, 2)
+        self.assertFalse(self.auth.exists())
+
+    def test_cancelled_post_prompt_check_also_cleans_credentials(self):
+        self.calls['preflight'].side_effect = [{}, KeyboardInterrupt()]
+        with self.assertRaises(KeyboardInterrupt):
+            gateway.main()
+        self.calls['start_transport'].assert_not_called()
+        self.assertFalse(self.auth.exists())
+
+    def test_write_failure_cleans_up_even_if_started_session_is_ready(self):
+        self.calls['ready'].side_effect = [False, True]
+        self.calls['private_write'].side_effect = OSError('synthetic state-write failure')
+        with self.assertRaises(OSError):
+            gateway.main()
+        self.calls['start_transport'].assert_called_once()
+        self.assertEqual(self.calls['stop_internal'].call_count, 2)
+        self.assertFalse(self.auth.exists())
+
+    def test_failed_final_readiness_check_is_not_success_and_cleans_credentials(self):
+        for final_result in (False, OSError('synthetic status read failure')):
+            with self.subTest(final_result=type(final_result).__name__):
+                self.calls['ready'].side_effect = [False, final_result]
+                with self.assertRaises((gateway.GatewayError, OSError)):
+                    gateway.main()
+                self.assertFalse(self.auth.exists())
 
 
 if __name__ == '__main__': unittest.main()

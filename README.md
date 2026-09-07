@@ -171,6 +171,8 @@ vpn-browser [https://private-host/]
 
 Transport comparison requires every named negative-test control to be explicitly true; empty or partial evidence cannot pass. Before saving the transport preference, the final connection must pass validation and host state must match the initial comparison baseline, not just the latest per-transport preflight. Failures trigger cleanup. Private `validation/comparison.json` checkpoints retain the failing stage and an allowlisted error category without exception text or subprocess arguments; `transports.json` retains completed and incomplete transport rows. A cleanup attempt is not proof of successful cleanup: verify current status separately.
 
+`start`, `restart` and `compare-transports` check the outer path before requesting credentials and again after interactive input, immediately before the first transport starts. The pre-prompt result cannot authorize a connection after an arbitrarily long wait. A failed or cancelled recheck prevents OpenVPN startup and triggers credential cleanup; it never weakens the egress or expected-adapter checks.
+
 ## Corporate DNS, Git and browser
 
 Pushed `dhcp-option DNS`, `DOMAIN` and `DOMAIN-SEARCH` are applied only to the Docker namespace or the nested managed WSL namespace. WSL uses a namespace-specific resolver bind mount for both systemd and fallback processes. Disconnect restores the namespace's outer resolver; the distro's WSL-generated resolver stays intact for the outer `slirp4netns` process and DNS tunneling. Windows DNS, outer-VPN DNS, global NRPT and other WSL distros are untouched.

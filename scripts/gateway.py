@@ -1133,14 +1133,15 @@ def compare_transports(backend='docker'):
         checkpoint('credentials')
         prompt_credentials(selected_backend)
         transports = list(configuration()['transports'])
-        for index, transport in enumerate(transports):
+        for transport in transports:
             row = {'connected': False, 'usable': False}
             results[transport] = row
-            if index:
-                # A torn-down backend needs a fresh verified outer path before
-                # any retained credentials can be reused on the next VPN.
-                checkpoint('transport_preflight', transport)
-                preflight(selected_backend)
+            # The initial check precedes an unbounded interactive prompt.
+            # Revalidate even the first transport: the outer VPN may have
+            # changed while credentials were being entered. Every subsequent
+            # teardown also requires a fresh verified outer path.
+            checkpoint('transport_preflight', transport)
+            preflight(selected_backend)
             checkpoint('transport_start', transport)
             row['connected'] = start_transport(transport, backend=selected_backend)
             current_state = wsl_status_data() if selected_backend == 'wsl' else read_json(STATE/'status.json')
@@ -1367,14 +1368,21 @@ def main():
             if action == 'start' and ready(selected_backend):
                 print('Already connected. Use '+CLI+' restart to switch sessions.'); status(selected_backend); return
             stop_internal(backend=selected_backend)
+            completed = False
             try:
                 preflight(selected_backend)
                 prompt_credentials(selected_backend)
+                # Input can take arbitrarily long; never start on the basis
+                # of the pre-prompt outer path alone.
+                preflight(selected_backend)
                 if not start_transport(selected, backend=selected_backend):
                     raise GatewayError('VPN not ready. See '+CLI+' logs; try another configured transport.')
                 private_write(RUNTIME/'active-backend', selected_backend+'\n')
-            finally:
                 if not ready(selected_backend):
+                    raise GatewayError('VPN readiness was lost before startup completed.')
+                completed = True
+            finally:
+                if not completed:
                     stop_internal(backend=selected_backend)
         elif action == 'stop':
             if positionals:
