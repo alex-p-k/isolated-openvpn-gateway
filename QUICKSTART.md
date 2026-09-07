@@ -79,6 +79,8 @@ HTTPS использует repository-local `socks5h`; SSH — repository-local 
 
 Для реальной Windows-приёмки выполните `tools\windows_acceptance.ps1` по `WINDOWS.md`. Для удаления только WSL backend: `vpn-gateway uninstall --backend wsl`. Полный rollback описан в `ROLLBACK.md`.
 
+Полный `vpn-gateway uninstall` удаляет также установленные команды и совпадающие с журналом локальные Git-настройки. Для WSL-only установки он не вызывает Docker. От удаления отдельного browser profile можно отказаться. Повторная установка использует исходные IT-профили и новый интерактивный ввод credentials; после неё заново выполните `git-configure` для нужного репозитория и проверки подключения. Не восстанавливайте auth-файл из backup.
+
 Сообщение `Connected` подтверждает туннель и SOCKS handshake, но не доступ к приложению. Выполните `vpn-gateway test https://REAL-PRIVATE-HOST/` со своим адресом без пароля/query; без URL приложение явно остаётся `NOT TESTED`. `compare-transports` временно разрывает корпоративные соединения, запрашивает credentials интерактивно и проверяет успешный SOCKS-запрос до остановки OpenVPN, блокировку после остановки и восстановление WSL-сеанса. Не присылайте credentials в чат.
 
 Дождитесь завершения Git-передач перед `compare-transports` или обновлением forwarder. Если сравнение не восстановило сеанс, проверьте `vpn-gateway status`: прежний успешный тест не означает, что gateway сейчас подключён. Новый запуск выполняется через `vpn-gateway start --backend wsl` с новым preflight и интерактивным вводом credentials. После `stop` проверяйте ошибку отдельного браузера принудительным обновлением `Ctrl+Shift+R`, а не по ранее загруженной странице.

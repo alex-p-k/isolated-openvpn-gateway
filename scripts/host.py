@@ -257,10 +257,14 @@ def private_write(path, data, *, mode=0o600, exclusive=False, system=None):
 def batch_launcher(python_executable, script_name):
     # Percent expansion occurs even inside quotes in cmd.exe.
     python = str(python_executable).replace('%', '%%').replace('\r', '').replace('\n', '')
+    # End the batch-file context before dispatching Python on the same parsed
+    # line. Otherwise self-uninstall deletes this file and CMD replaces Python's
+    # exit code with "batch file cannot be found". The empty GOTO diagnostic is
+    # suppressed only for that builtin, never for Python or its exit status.
     return ('@echo off\r\n'
             '@chcp 65001 >nul\r\n'
             'set "PYTHONDONTWRITEBYTECODE=1"\r\n'
-            '"' + python + '" "%~dp0..\\scripts\\' + script_name + '" %*\r\n').encode()
+            '(goto) 2>nul & "' + python + '" "%~dp0..\\scripts\\' + script_name + '" %*\r\n').encode()
 
 
 def ensure_windows_command_paths(*paths):

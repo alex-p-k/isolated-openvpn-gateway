@@ -31,13 +31,19 @@ vpn-gateway uninstall
 
 Full uninstall removes only:
 
-- project-owned Docker containers and local image tags, when Docker is present;
+- project-owned Docker containers and local image tags, when the selected backend is Docker;
 - the managed WSL distro, only after the ownership checks and a second explicit confirmation;
 - installed gateway files/launchers and ephemeral runtime/validation data;
 - repository-local Git keys only when their current values still exactly match the values recorded by the gateway;
 - the separate browser profile only after a separate confirmation and ownership-marker check.
 
 It preserves Docker Desktop, WSL components, other distros, outer VPN software, Windows Firewall/routes/DNS/NRPT, global Git/SSH settings, repository contents and remote URLs.
+
+Full uninstall of a WSL deployment never invokes Docker, even if a stopped or broken Docker Desktop is installed. Previously used Docker resources, if any, must be cleaned up separately with that backend and its engine available; a WSL-only uninstall deliberately leaves them untouched. The separate browser profile can also be retained by declining its optional deletion prompt.
+
+The Windows CMD launcher exits its batch-file context before dispatching Python so deleting that launcher during a successful uninstall does not replace the result with a spurious "batch file cannot be found" failure. Actual Windows direct and `CALL` tests verify both zero and nonzero Python exit codes, including self-deletion. Older launchers can report this error after removal has already completed: inspect the exact owned installation path and distro inventory before retrying; never interpret the exit code alone as proof that nothing was removed.
+
+Reinstall from the verified public package and the original IT deployment inputs, then provision the selected backend, reapply the intended repository-local Git settings and enter fresh credentials. Retain only approved private metadata/evidence outside the removed installation with restrictive ACLs; do not back up auth, derived profiles, browser cookies or the WSL VHDX as session recovery. Repeat outer preflight, corporate connectivity and paired fail-closed checks after reconnecting.
 
 HTTPS Git authentication stored by the user's credential helper (for example Windows Credential Manager) is separate from the gateway's temporary OpenVPN auth file. Gateway stop/uninstall does not erase those credentials or a completed clone. To revoke Git access, use the organization's credential/token revocation procedure; do not delete unrelated Credential Manager entries.
 

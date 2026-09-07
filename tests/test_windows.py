@@ -77,6 +77,40 @@ class HostTests(unittest.TestCase):
         self.assertIn('PYTHONDONTWRITEBYTECODE', value)
         self.assertNotIn('password', value.lower())
 
+    @unittest.skipUnless(os.name == 'nt', 'Actual cmd.exe self-deleting launcher test')
+    def test_batch_launcher_preserves_exit_code_when_uninstall_deletes_it(self):
+        for remove in (False, True):
+            for code in (0, 7):
+                with self.subTest(remove=remove, code=code), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)/"Test (O'Brien $name)"
+                    (root/'bin').mkdir(parents=True)
+                    (root/'scripts').mkdir()
+                    launcher = root/'bin/vpn-gateway.cmd'
+                    launcher.write_bytes(host.batch_launcher(sys.executable, 'gateway.py'))
+                    (root/'scripts/gateway.py').write_text(
+                        "import sys\nfrom pathlib import Path\n"
+                        "if sys.argv[2] == 'remove':\n"
+                        "    (Path(__file__).resolve().parents[1]/'bin/vpn-gateway.cmd').unlink()\n"
+                        "print('SYNTHETIC-LAUNCHER-COMPLETE')\nsys.exit(int(sys.argv[1]))\n")
+                    result = subprocess.run([os.environ.get('ComSpec','cmd.exe'), '/d', '/c',
+                        str(launcher), str(code), 'remove' if remove else 'keep'],
+                        capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+                    self.assertEqual(result.stdout.strip(), 'SYNTHETIC-LAUNCHER-COMPLETE')
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    self.assertEqual(result.stderr, '')
+                    self.assertEqual(launcher.exists(), not remove)
+                    # A user's wrapper may CALL the launcher and continue; it
+                    # must receive the same exit status without being closed.
+                    launcher.write_bytes(host.batch_launcher(sys.executable, 'gateway.py'))
+                    caller = Path(tmp)/'caller.cmd'
+                    caller.write_text('@echo off\ncall "'+str(launcher)+'" '+str(code)+' '+
+                        ('remove' if remove else 'keep')+'\nexit /b %errorlevel%\n')
+                    called = subprocess.run([os.environ.get('ComSpec','cmd.exe'),'/d','/c',str(caller)],
+                        capture_output=True,text=True,timeout=20,creationflags=subprocess.CREATE_NO_WINDOW)
+                    self.assertEqual(called.stdout.strip(),'SYNTHETIC-LAUNCHER-COMPLETE')
+                    self.assertEqual(called.returncode,code,called.stderr)
+                    self.assertEqual(called.stderr,'')
+
     def test_ntfs_acl_command_is_sid_based_and_removes_inheritance(self):
         command = host.windows_acl_command(Path(r'C:\Private\auth'), 'S-1-5-21-1234', False)
         self.assertEqual(command[:4], ['icacls.exe', r'C:\Private\auth', '/inheritance:r', '/grant:r'])
@@ -414,6 +448,29 @@ class WindowsGatewayTests(unittest.TestCase):
                  patch.object(gateway, 'stop_internal'), patch.object(gateway, 'docker'):
                 self.assertTrue(gateway.uninstall())
             self.assertTrue(root.exists())
+
+    def test_full_uninstall_contacts_only_selected_docker_backend(self):
+        for backend, windows in (('wsl', True), ('docker', True), ('docker', False)):
+            with self.subTest(backend=backend, windows=windows), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)/'IsolatedOpenVPNGateway'; root.mkdir()
+                (root/'installation.json').write_text('{"project":"isolated-openvpn-gateway"}')
+                executable = Path(tmp)/'docker.exe'; executable.write_bytes(b'synthetic only')
+                with patch.object(gateway, 'ROOT', root), \
+                     patch.object(gateway, 'DOCKER', str(executable)), \
+                     patch.object(gateway, 'active_backend', return_value=backend), \
+                     patch.object(gateway.host, 'IS_WINDOWS', windows), \
+                     patch.object(gateway.host, 'install_root', return_value=root), \
+                     patch.object(gateway.host, 'browser_root', return_value=Path(tmp)/'absent'), \
+                     patch('builtins.input', return_value='REMOVE'), \
+                     patch.object(gateway, 'stop_internal') as stop, \
+                     patch.object(gateway, 'docker') as docker:
+                    self.assertEqual(gateway.uninstall(), windows)
+                stop.assert_called_once_with(backend=backend)
+                if backend == 'wsl':
+                    docker.assert_not_called()
+                else:
+                    self.assertEqual([call.args for call in docker.call_args_list],
+                        [('image', 'rm', gateway.IMAGE), ('image', 'rm', gateway.SOCKS_IMAGE)])
 
     def test_windows_main_removes_root_only_after_lock_context_closes(self):
         events = []

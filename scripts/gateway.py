@@ -1330,7 +1330,9 @@ def uninstall():
         if input('Full uninstall must remove the project-owned managed WSL distro. Type REMOVE WSL: ') != 'REMOVE WSL':
             raise GatewayError('Full uninstall cancelled; the managed distro and host installation were preserved.')
         uninstall_wsl_backend(confirm=False)
-    if Path(DOCKER).is_file():
+    # A WSL-only removal must not contact an unrelated/broken Docker Desktop.
+    # Docker cleanup remains available when removing a Docker deployment.
+    if selected == 'docker' and Path(DOCKER).is_file():
         for image in (IMAGE,SOCKS_IMAGE):
             docker('image','rm',image,check=False)
     profile=host.browser_root()
