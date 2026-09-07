@@ -371,6 +371,37 @@ class WindowsBrowserTests(unittest.TestCase):
 
 
 class SocksConnectTests(unittest.TestCase):
+    def test_stdio_relay_reads_short_packets_without_waiting_for_eof(self):
+        import threading
+        arrived = threading.Event()
+        class Source:
+            packets = [b'SSH-2.0-test\r\n', b'']
+            def read(self, length):
+                raise AssertionError('Buffered read waits for more SSH data')
+            def read1(self, length):
+                return self.packets.pop(0)
+        class Stream:
+            def sendall(self, data):
+                self.sent = data
+                arrived.set()
+            def shutdown(self, how): pass
+            def recv(self, length):
+                if not arrived.wait(2):
+                    raise TimeoutError('Short SSH packet was not forwarded')
+                return b''
+        stream = Stream()
+        socks_connect.relay(stream, Source(), io.BytesIO())
+        self.assertEqual(stream.sent, b'SSH-2.0-test\r\n')
+
+    def test_proxy_negotiation_is_bounded_before_unlimited_stdio_relay(self):
+        events = []
+        with patch.object(socks_connect.socket, 'create_connection') as connect, \
+             patch.object(socks_connect, 'negotiate', side_effect=lambda *args: events.append('negotiate')), \
+             patch.object(socks_connect, 'relay', side_effect=lambda *args: events.append('relay')):
+            connect.return_value.__enter__.return_value.settimeout.side_effect = events.append
+            self.assertEqual(socks_connect.main(['127.0.0.1','1080','git.example.test','22']), 0)
+        self.assertEqual(events, [12, 'negotiate', None, 'relay'])
+
     def test_socks_handshake_supports_proxy_side_domain_resolution(self):
         class Stream:
             def __init__(self):

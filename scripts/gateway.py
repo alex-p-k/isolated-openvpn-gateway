@@ -155,6 +155,10 @@ def wsl(*args, input=None, **kwargs):
     kwargs.setdefault('errors', 'replace')
     return run(wsl_backend.wsl_command(*args, executable=WSL), input=input, **kwargs)
 
+def wsl_network(*args, **kwargs):
+    """Inspect the gateway's network, never the shared outer WSL namespace."""
+    return wsl('/usr/sbin/ip', 'netns', 'exec', PROJECT, *args, **kwargs)
+
 def wsl_names():
     result = run([WSL, '--list', '--quiet'], check=False, timeout=20)
     return wsl_backend.distro_names(result.stdout) if result.returncode == 0 else []
@@ -916,15 +920,15 @@ def validation(target=None, backend='docker'):
         listeners = listener_result()
         result['loopback_publish_only'] = all(listeners.get(key) is True for key in (
             'listener_present','loopback_only','ipv4_wildcard_absent','ipv6_wildcard_absent'))
-        route=wsl('/sbin/ip','route','get','1.1.1.1','uid','10000',check=False,timeout=15)
-        result['proxy_route_tun0']='dev tun0' in route.stdout
-        result['tun0_exists']=wsl('/sbin/ip','link','show','tun0',check=False,timeout=15).returncode == 0
-        chain=wsl('/usr/sbin/iptables','-C','OUTPUT','-m','owner','--uid-owner','10000',
+        route=wsl_network('/sbin/ip','route','get','1.1.1.1','uid','10000',check=False,timeout=15)
+        result['proxy_route_tun0']=route.returncode == 0 and 'dev tun0' in route.stdout
+        result['tun0_exists']=wsl_network('/sbin/ip','link','show','tun0',check=False,timeout=15).returncode == 0
+        chain=wsl_network('/usr/sbin/iptables','-C','OUTPUT','-m','owner','--uid-owner','10000',
                   '-j','IOVG_WSL_PROXY',check=False,timeout=15)
         result['fail_closed_firewall_installed']=chain.returncode == 0
         outer=state.get('outer_interface')
         if outer:
-            forced=wsl('/usr/sbin/runuser','-u','proxyuser','--','/usr/bin/curl','--interface',outer,
+            forced=wsl_network('/usr/sbin/runuser','-u','proxyuser','--','/usr/bin/curl','--interface',outer,
                        '--noproxy','*','-fsS','--connect-timeout','3','--max-time','4',
                        'http://1.1.1.1/',check=False,timeout=8)
             result['forced_eth0_blocked']=forced.returncode != 0
@@ -1061,7 +1065,11 @@ def compare_transports(backend='docker'):
     selected=None
     try:
         transports = list(configuration()['transports'])
-        for transport in transports:
+        for index, transport in enumerate(transports):
+            if index:
+                # stop_internal removed the previous backend network. Verify
+                # the new outer path before reusing credentials on a new VPN.
+                preflight(selected_backend)
             ok=start_transport(transport, backend=selected_backend)
             current_state=wsl_status_data() if selected_backend == 'wsl' else read_json(STATE/'status.json')
             row={'connected':ok, 'openvpn_initialized':bool(current_state.get('initialization_completed')),
@@ -1076,6 +1084,7 @@ def compare_transports(backend='docker'):
             stop_internal(keep_auth=True, backend=selected_backend)
         selected=next((x for x in transports if results[x]['usable']),None)
         if selected:
+            preflight(selected_backend)
             if not start_transport(selected, backend=selected_backend):
                 selected=None
                 raise GatewayError('Chosen transport failed its repeat connection test.')

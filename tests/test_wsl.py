@@ -36,6 +36,59 @@ CONFIG = configlib.load_config(ROOT/'gateway.example.toml')
 
 
 class PureWslTests(unittest.TestCase):
+    def test_transport_comparison_rechecks_outer_path_before_next_vpn(self):
+        with patch.object(gateway, 'backend_name', return_value='wsl'), \
+             patch.object(gateway, 'stop_internal') as stop, \
+             patch.object(gateway, 'preflight', side_effect=[{}, gateway.GatewayError('outer unavailable')]) as preflight, \
+             patch.object(gateway, 'prompt_credentials') as credentials, \
+             patch.object(gateway, 'configuration', return_value={'transports':{'udp':{},'tcp':{}}}), \
+             patch.object(gateway, 'start_transport', return_value=False) as start, \
+             patch.object(gateway, 'wsl_status_data', return_value={}), \
+             patch.object(gateway, 'private_write'):
+            with self.assertRaisesRegex(gateway.GatewayError, 'outer unavailable'):
+                gateway.compare_transports('wsl')
+        self.assertEqual(preflight.call_count, 2)
+        credentials.assert_called_once_with('wsl')
+        start.assert_called_once_with('udp', backend='wsl')
+        self.assertEqual(stop.call_args.kwargs, {'backend':'wsl'})
+
+    def test_wsl_network_command_enters_only_the_managed_namespace(self):
+        with patch.object(gateway, 'wsl') as invoke:
+            gateway.wsl_network('/sbin/ip', 'link', 'show', 'tun0', check=False, timeout=15)
+        invoke.assert_called_once_with('/usr/sbin/ip', 'netns', 'exec',
+            'isolated-openvpn-gateway', '/sbin/ip', 'link', 'show', 'tun0',
+            check=False, timeout=15)
+
+    def test_validation_checks_tunnel_routes_and_firewall_inside_gateway_namespace(self):
+        for missing in (False, True):
+            with self.subTest(namespace_missing=missing), \
+                 patch.object(gateway, 'backend_name', return_value='wsl'), \
+                 patch.object(gateway, 'read_json', return_value={}), \
+                 patch.object(gateway, 'network_snapshot', return_value={}), \
+                 patch.object(gateway, 'wsl_status_data', return_value={
+                     'ready':True, 'outer_interface':'eth0'}), \
+                 patch.object(gateway, 'socks_available', return_value=True), \
+                 patch.object(gateway, 'listener_result', return_value={
+                     key:True for key in ('listener_present','loopback_only',
+                         'ipv4_wildcard_absent','ipv6_wildcard_absent')}), \
+                 patch.object(gateway, 'private_write'), \
+                 patch('builtins.print'), \
+                 patch.object(gateway, 'wsl') as invoke:
+                invoke.side_effect = [
+                    SimpleNamespace(returncode=int(missing), stdout='dev tun0'),
+                    SimpleNamespace(returncode=int(missing), stdout=''),
+                    SimpleNamespace(returncode=int(missing), stdout=''),
+                    SimpleNamespace(returncode=1, stdout='')]
+                result = gateway.validation(backend='wsl')
+                self.assertEqual(invoke.call_count, 4)
+                for call in invoke.call_args_list:
+                    self.assertEqual(call.args[:4], ('/usr/sbin/ip','netns','exec',
+                        'isolated-openvpn-gateway'))
+                for key in ('proxy_route_tun0','tun0_exists','fail_closed_firewall_installed'):
+                    self.assertEqual(result[key], not missing)
+                if missing:
+                    self.assertFalse(result['passed'])
+
     def test_socks_greeting_handles_fragmented_reply(self):
         with patch.object(gateway,'configuration',return_value=CONFIG), \
              patch.object(gateway.socket,'create_connection') as connect:

@@ -325,7 +325,7 @@ See `ROLLBACK.md` for ownership boundaries, `.wslconfig` recovery and manual ver
 - [Docker — Windows installation and editions](https://docs.docker.com/desktop/setup/install/windows-install/)
 - [Docker — WSL2 backend](https://docs.docker.com/desktop/features/wsl/)
 
-## Current verification limitation
+## Current verification evidence and limitations
 
 The development host is Windows 11 Home Single Language (`EditionID=CoreSingleLanguage`, 25H2, build `26200.9168`), AMD64, 31.8 GiB RAM. On 2026-09-07, after reboot, WSL 2.7.12 and the hypervisor were confirmed active. A separate Debian WSL2 distro was created and real checks confirmed systemd and `/dev/net/tun`.
 
@@ -335,4 +335,12 @@ Real infrastructure checks passed: the root HTTPS outer control succeeded while 
 
 The source-built Dante fallback is pinned, not managed by Debian security updates. Updating it requires reviewing a new upstream release/checksum and repeating the runtime tests; do not silently download an unpinned latest version. Ordinary Debian dependencies continue to use Debian packages.
 
-Docker is absent. Corporate OpenVPN initialization, full corporate SOCKS positive/negative tests, pushed corporate DNS, Git, browser and an actual remote LAN-device test remain unverified. Tests with mocks are not evidence that those network requirements work.
+After the user entered credentials interactively, real corporate acceptance passed for two supplied UDP profiles: OpenVPN initialized, tun0 and UID routing were present inside the gateway namespace, and a TCP DNS payload reached a pushed DNS server through the Windows SOCKS endpoint. Each positive/negative test stopped only OpenVPN, confirmed tun0 absent and SOCKS blocked, observed a firewall REJECT counter increment for UID 10000 while root HTTPS through eth0 succeeded, removed its narrow probe route, and restored the VPN plus successful DNS payload. The DNS canary used a configured hostname; this alone does not prove access to every private application.
+
+Host snapshots before and after the connected tests confirmed Windows DNS, default/static/public routes, public egress and global Git proxy unchanged. Windows OpenVPN processes were absent. Linux credentials were root-owned mode 600. After a later outer-preflight failure interrupted transport comparison, cleanup removed the real auth file and Windows listener. TCP443 was **not** tested: WSL public egress was unavailable both before that attempt and before restoring the original transport. Corporate OpenVPN was not started on an unverified outer path. Later root-WSL and nested-namespace DNS/HTTPS diagnostics succeeded with matching Windows egress. This intermittent failure remains unresolved; do not weaken preflight or claim stable compatibility for every VPN client.
+
+`test` now executes WSL tunnel/route/firewall diagnostics inside `isolated-openvpn-gateway`, not the root/shared WSL namespace. `compare-transports` repeats outer preflight after each backend teardown and before its final connection, without asking for credentials again inside the controlled comparison; an error triggers cleanup.
+
+A subsequent interactive start passed again. The user-supplied private task-tracker URL returned HTTPS 302 through SOCKS with TLS certificate validation enabled; host preservation and gateway validation still passed. A direct SOCKS domain-name request received the corporate Git server's SSH banner. Fixing the stdio bridge to use `read1` for short packets removed the Git timeout; SSH then failed authentication, and the HTTPS read-only attempt also required credentials. No keys were added, TLS/host-key checks were not bypassed, and no repository was cloned or pushed. The separate Chrome profile was launched, but automatic UI inspection stopped because computer-use could not confidently identify the current URL. Visual browser behavior and browser failure with the gateway off remain unverified.
+
+A Docker CLI (29.7.2, context `desktop-linux`) is now present, but the Docker Linux engine is not running. Actual Docker-backend, authenticated private Git/browser, TCP transport, remote LAN-device and full uninstall acceptance remain incomplete. Existing macOS behavior is tested with mocks on Windows, not an actual macOS machine. The automated suite runs 96 tests: 94 pass and 2 platform-specific cases are skipped on Windows. Automated tests cannot substitute for missing network checks. Diagnostic JSON and private deployment inputs remain outside Git.

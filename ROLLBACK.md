@@ -88,3 +88,5 @@ After stop/uninstall/rollback, confirm:
 6. A non-corporate Git repository has no gateway-local proxy unless it was explicitly configured.
 
 Use the read-only portions of `tools\windows_acceptance.ps1` or the commands in `WINDOWS.md`; never weaken Firewall or change routes/DNS to make a check pass.
+
+If an outer-path check fails during transport comparison, the command stops and removes ephemeral credentials. It must not restore a corporate session over an unverified outer path. Once the external VPN and backend egress pass again, run `vpn-gateway start --backend wsl` and enter credentials interactively; do not recover an auth file from a backup. A successful positive/negative test earlier in the comparison does not mean the final session was restored: check the final status separately.

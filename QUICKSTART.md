@@ -60,3 +60,5 @@ vpn-gateway stop
 HTTPS использует repository-local `socks5h`; SSH — repository-local `core.sshCommand`. Глобальные Git/SSH proxy не создаются. Репозитории остаются на NTFS.
 
 Для реальной Windows-приёмки выполните `tools\windows_acceptance.ps1` по `WINDOWS.md`. Для удаления только WSL backend: `vpn-gateway uninstall --backend wsl`. Полный rollback описан в `ROLLBACK.md`.
+
+Сообщение `Connected` подтверждает туннель и SOCKS handshake, но не доступ к приложению. Выполните `vpn-gateway test https://REAL-PRIVATE-HOST/` со своим адресом без пароля/query; без URL приложение явно остаётся `NOT TESTED`. `compare-transports` временно разрывает корпоративные соединения, запрашивает credentials интерактивно и проверяет успешный SOCKS-запрос до остановки OpenVPN, блокировку после остановки и восстановление WSL-сеанса. Не присылайте credentials в чат.

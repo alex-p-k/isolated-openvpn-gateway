@@ -57,8 +57,12 @@ def relay(sock, source, destination):
 
     def upload():
         try:
+            # BufferedReader.read(n) may wait for n bytes or EOF on a pipe.
+            # SSH exchanges short packets while stdin stays open; read1 emits
+            # the available packet without waiting for the 64 KiB buffer.
+            read = getattr(source, 'read1', source.read)
             while True:
-                data = source.read(65536)
+                data = read(65536)
                 if not data:
                     break
                 sock.sendall(data)
@@ -92,8 +96,9 @@ def main(argv=None):
         if not proxy_address.is_loopback:
             raise ProxyError('Only a loopback SOCKS5 proxy is accepted.')
         with socket.create_connection((str(proxy_address), int(proxy_port)), timeout=12) as sock:
-            sock.settimeout(None)
+            sock.settimeout(12)
             negotiate(sock, target_host, int(target_port))
+            sock.settimeout(None)
             relay(sock, sys.stdin.buffer, sys.stdout.buffer)
         return 0
     except (OSError, ValueError) as exc:

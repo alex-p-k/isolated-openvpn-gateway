@@ -62,6 +62,10 @@ Release строится по явному allowlist и не включает `g
 
 Если внешний VPN не наследуется WSL/Docker, это blocker. Возможный mirrored mode обсуждается отдельно, с backup, явным согласием, `wsl --shutdown`, повторным preflight и rollback из `ROLLBACK.md`.
 
+## Границы подтверждённой проверки
+
+На Windows 11 Home Single Language 25H2 (build 26200.9168, AMD64) 2026-09-07 подтверждены реальное корпоративное подключение WSL2, ответ pushed DNS через Windows SOCKS, positive/negative fail-closed с независимым внешним control case и восстановление сеанса. Windows routes/DNS/egress и глобальный Git proxy сохранились. Это не заменяет проверку конкретного private URL и Git-репозитория новым пользователем: доступ к приложению, его авторизация и отдельный browser проверяются отдельно. Полные диагностические JSON остаются приватными и не входят в release; актуальные ограничения перечислены в `WINDOWS.md`.
+
 ## Снятие доступа
 
 ```text
