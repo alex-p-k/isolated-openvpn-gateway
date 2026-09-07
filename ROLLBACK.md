@@ -39,6 +39,12 @@ Full uninstall removes only:
 
 It preserves Docker Desktop, WSL components, other distros, outer VPN software, Windows Firewall/routes/DNS/NRPT, global Git/SSH settings, repository contents and remote URLs.
 
+HTTPS Git authentication stored by the user's credential helper (for example Windows Credential Manager) is separate from the gateway's temporary OpenVPN auth file. Gateway stop/uninstall does not erase those credentials or a completed clone. To revoke Git access, use the organization's credential/token revocation procedure; do not delete unrelated Credential Manager entries.
+
+## PowerShell acceptance policy
+
+The installer and gateway do not change PowerShell execution policy. If acceptance is blocked, preserve the result of `Get-ExecutionPolicy -List` and request a separate owner decision. A separately approved process-only policy ends when that PowerShell process and its children exit; verify `CurrentUser`, `LocalMachine` and Group Policy scopes still match the recorded state. No persistent-policy rollback should be needed. Do not change persistent scopes or indirectly execute a blocked script merely to pass acceptance.
+
 ## `.wslconfig` NAT/mirrored rollback
 
 The gateway never edits `%USERPROFILE%\.wslconfig`. If the machine owner manually tested mirrored mode, a backup must have been made first:

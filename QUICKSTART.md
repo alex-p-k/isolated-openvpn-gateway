@@ -62,3 +62,7 @@ HTTPS использует repository-local `socks5h`; SSH — repository-local 
 Для реальной Windows-приёмки выполните `tools\windows_acceptance.ps1` по `WINDOWS.md`. Для удаления только WSL backend: `vpn-gateway uninstall --backend wsl`. Полный rollback описан в `ROLLBACK.md`.
 
 Сообщение `Connected` подтверждает туннель и SOCKS handshake, но не доступ к приложению. Выполните `vpn-gateway test https://REAL-PRIVATE-HOST/` со своим адресом без пароля/query; без URL приложение явно остаётся `NOT TESTED`. `compare-transports` временно разрывает корпоративные соединения, запрашивает credentials интерактивно и проверяет успешный SOCKS-запрос до остановки OpenVPN, блокировку после остановки и восстановление WSL-сеанса. Не присылайте credentials в чат.
+
+Дождитесь завершения Git-передач перед `compare-transports` или обновлением forwarder. Если сравнение не восстановило сеанс, проверьте `vpn-gateway status`: прежний успешный тест не означает, что gateway сейчас подключён. Новый запуск выполняется через `vpn-gateway start --backend wsl` с новым preflight и интерактивным вводом credentials. После `stop` проверяйте ошибку отдельного браузера принудительным обновлением `Ctrl+Shift+R`, а не по ранее загруженной странице.
+
+Если PowerShell блокирует acceptance script, не меняйте системную execution policy и не обходите блокировку косвенным запуском. Порядок отдельного согласования process-only policy и rollback описан в `WINDOWS.md` и `ROLLBACK.md`.
