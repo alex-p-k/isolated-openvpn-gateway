@@ -51,12 +51,18 @@ def configuration():
         raise GatewayError(str(exc)) from None
 
 def run(args, *, check=True, timeout=40, capture=True, env=None, **kwargs):
+    child_env = ENV if env is None else env
+    if str(args[0]).replace('\\', '/').rsplit('/', 1)[-1].casefold() == 'powershell.exe':
+        # Python launched by PS7 inherits PS7 module paths, which Windows
+        # PowerShell 5.1 cannot load. Let that child rebuild its default paths;
+        # never mutate parent/system environment or execution policy.
+        child_env = {key: value for key, value in child_env.items() if key.upper() != 'PSMODULEPATH'}
     if str(args[0]).casefold() == str(POWERSHELL).casefold() and '-Command' in args:
         # powershell() explicitly writes UTF-8; do not decode it using the
         # current Windows ANSI locale (which may differ from the console).
         kwargs.setdefault('encoding', 'utf-8')
     if capture and str(args[0]).lower().endswith(('wsl.exe', '/wsl')) and '--exec' not in args:
-        result = subprocess.run([str(x) for x in args], env=ENV if env is None else env,
+        result = subprocess.run([str(x) for x in args], env=child_env,
                                 capture_output=True, timeout=timeout, **kwargs)
         result.stdout = wsl_backend.normalize_output(result.stdout)
         result.stderr = wsl_backend.normalize_output(result.stderr)
@@ -71,7 +77,7 @@ def run(args, *, check=True, timeout=40, capture=True, env=None, **kwargs):
         errors = kwargs.pop('errors', 'replace')
         if isinstance(kwargs['input'], str):
             kwargs['input'] = kwargs['input'].encode(encoding, errors=errors)
-    result = subprocess.run([str(x) for x in args], env=ENV if env is None else env,
+    result = subprocess.run([str(x) for x in args], env=child_env,
                             text=not binary_input, capture_output=capture, timeout=timeout, **kwargs)
     if binary_input and capture:
         result.stdout = result.stdout.decode(encoding, errors=errors)

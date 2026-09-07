@@ -36,6 +36,23 @@ CONFIG = configlib.load_config(ROOT/'gateway.example.toml')
 
 
 class PureWslTests(unittest.TestCase):
+    def test_slirp_targets_named_namespace_not_a_racing_keeper_pid(self):
+        keeper = SimpleNamespace(pid=12345)
+        slirp = SimpleNamespace(pid=12346, poll=lambda: None)
+        with patch.object(manager_module, 'require_root'), \
+             patch.object(manager_module, 'network_ready', side_effect=[False, True]), \
+             patch.object(manager_module, 'network_stop'), \
+             patch.object(manager_module, 'restore_resolver'), \
+             patch.object(manager_module, 'private_write'), \
+             patch.object(manager_module, 'run'), \
+             patch.object(manager_module.subprocess, 'Popen', side_effect=[keeper, slirp]) as popen:
+            manager_module.network_start()
+        command = popen.call_args_list[1].args[0]
+        self.assertEqual(command[0], '/usr/bin/slirp4netns')
+        self.assertIn('--netns-type=path', command)
+        self.assertEqual(command[-2:], [str(manager_module.NETNS_PATH), 'eth0'])
+        self.assertNotIn(str(keeper.pid), command)
+
     def test_transport_comparison_rechecks_outer_path_before_next_vpn(self):
         with patch.object(gateway, 'backend_name', return_value='wsl'), \
              patch.object(gateway, 'stop_internal') as stop, \

@@ -176,6 +176,45 @@ class WindowsInstallerTests(unittest.TestCase):
 
 
 class WindowsGatewayTests(unittest.TestCase):
+    def test_windows_powershell_gets_default_module_paths_without_parent_mutation(self):
+        environment = {'PSMODULEPATH': 'PS7 modules', 'PSModulePath': 'another casing',
+                       'PATH': 'retained path', 'PSExecutionPolicyPreference': 'AllSigned'}
+        original = dict(environment)
+        completed = SimpleNamespace(returncode=0, stdout='', stderr='')
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit), patch.object(gateway, 'ENV', environment), \
+                 patch.object(gateway.subprocess, 'run', return_value=completed) as invoke:
+                gateway.run([r'C:\Windows\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE', '-File', 'local.ps1'],
+                            **({'env': environment} if explicit else {}))
+                child = invoke.call_args.kwargs['env']
+                self.assertEqual(child, {'PATH': 'retained path', 'PSExecutionPolicyPreference': 'AllSigned'})
+                self.assertEqual(environment, original)
+
+    def test_other_commands_keep_their_module_environment(self):
+        environment = {'PSModulePath': 'caller modules', 'PATH': 'retained path'}
+        completed = SimpleNamespace(returncode=0, stdout='', stderr='')
+        for executable in ('pwsh.exe', 'pwsh', 'docker.exe', 'wsl.exe', '/usr/bin/curl'):
+            with self.subTest(executable=executable), \
+                 patch.object(gateway.subprocess, 'run', return_value=completed) as invoke:
+                gateway.run([executable, '--exec'], env=environment)
+                self.assertEqual(invoke.call_args.kwargs['env'], environment)
+
+    @unittest.skipUnless(gateway.host.IS_WINDOWS, 'requires actual Windows PowerShell modules')
+    def test_real_windows_security_module_loads_with_poisoned_inherited_module_path(self):
+        import json
+        environment = dict(gateway.ENV)
+        # Deliberately omit standard module locations: this would prevent
+        # autoloading without the child-only reset, even without PS7 installed.
+        environment['PSMODULEPATH'] = r'C:\nonexistent-gateway-module-test'
+        command = gateway.powershell(
+            "$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Security; "
+            "@{Version=$PSVersionTable.PSVersion.Major; Policy=(Get-ExecutionPolicy).ToString()} | ConvertTo-Json -Compress")
+        result = gateway.run(command, env=environment, timeout=15,
+                             creationflags=gateway.subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(json.loads(result.stdout)['Version'], 5)
+        self.assertTrue(json.loads(result.stdout)['Policy'])
+        self.assertEqual(environment['PSMODULEPATH'], r'C:\nonexistent-gateway-module-test')
+
     def test_powershell_output_and_decoder_use_explicit_utf8(self):
         completed = SimpleNamespace(returncode=0, stdout='ready', stderr='')
         command = gateway.powershell("Write-Output 'ready'")

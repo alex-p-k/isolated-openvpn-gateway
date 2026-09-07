@@ -169,7 +169,9 @@ def network_start():
     private_write(NETNS_PID, (str(keeper.pid) + '\n').encode())
     slirp = subprocess.Popen(['/usr/bin/slirp4netns', '--configure', '--mtu=65520',
                               '--disable-host-loopback', '--cidr=10.0.2.0/24',
-                              str(keeper.pid), 'eth0'], stdin=subprocess.DEVNULL,
+                              # The keeper may not have entered the namespace
+                              # yet. A PID target races with ip's setns call.
+                              '--netns-type=path', str(NETNS_PATH), 'eth0'], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
     private_write(SLIRP_PID, (str(slirp.pid) + '\n').encode())
