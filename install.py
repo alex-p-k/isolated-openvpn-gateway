@@ -266,6 +266,30 @@ def profile_arguments(values, configuration):
     return result
 
 
+def windows_shell_instructions(root, backend):
+    """Copyable PowerShell commands using the actual resolved installation root."""
+    if backend not in ('docker', 'wsl'):
+        raise InstallError('Unknown backend for Windows launcher instructions.')
+    def literal(value):
+        value = str(value)
+        if any(character in value for character in ('\r', '\n', '\x00')):
+            raise InstallError('Unsafe path in Windows launcher instructions.')
+        return "'" + value.replace("'", "''") + "'"
+    root = Path(root)
+    command = '& ' + literal(root/'bin'/'vpn-gateway.cmd')
+    lines = ['Next: configure windows_outer_adapter_contains and enable the outer VPN.',
+             'Run these commands in Windows PowerShell (no permanent PATH changes):']
+    if backend == 'wsl':
+        lines.append(command + ' install --backend wsl')
+    lines.append(command + ' start --backend ' + backend)
+    lines += ['For short command names in this PowerShell window only:',
+              '$gatewayBin = ' + literal(root/'bin'),
+              "$env:Path = $gatewayBin + ';' + $env:Path",
+              'vpn-gateway status',
+              'Repeat the two PATH setup lines in each new PowerShell window.']
+    return lines
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='read-only environment/profile checks; no installation')
@@ -326,15 +350,7 @@ def main(argv=None):
     print('Installed: ' + str(root))
     print('No VPN was started; host DNS/routes, global Git and browser profiles were not changed.')
     if hostlib.IS_WINDOWS:
-        command = root/'bin'/'vpn-gateway.cmd'
-        print('Next: configure windows_outer_adapter_contains and enable the outer VPN.')
-        if args.backend == 'wsl':
-            print('Provision the separate Docker-free distro, then start:')
-            print('  "'+str(command)+'" install --backend wsl')
-            print('  "'+str(command)+'" start --backend wsl')
-        else:
-            print('  "'+str(command)+'" start --backend docker')
-        print('For this PowerShell window only: $env:Path="'+str(root/'bin')+';$env:Path"')
+        print('\n'.join(windows_shell_instructions(root, args.backend)))
     else:
         print('Next: enable your outer VPN, then run ~/.local/bin/vpn-gateway start')
         print('If commands are not in PATH, run: export PATH="$HOME/.local/bin:$PATH"')

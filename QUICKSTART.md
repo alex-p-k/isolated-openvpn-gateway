@@ -15,7 +15,11 @@ WSL2 должен быть установлен заранее (обычно о�
 ```powershell
 py -3.11 .\install.py --check --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
 py -3.11 .\install.py         --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
-$env:Path = "$env:LOCALAPPDATA\IsolatedOpenVPNGateway\bin;$env:Path"
+```
+
+Скопируйте две строки настройки PATH, выведенные установщиком после `Installed:`. Они содержат фактический путь к `bin` и действуют только в текущем окне PowerShell. Затем:
+
+```powershell
 vpn-gateway install --backend wsl
 vpn-gateway start --backend wsl
 vpn-gateway test
@@ -31,12 +35,26 @@ vpn-browser https://private-host/
 ```powershell
 py -3.11 .\install.py --check --backend docker --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
 py -3.11 .\install.py         --backend docker --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
-$env:Path = "$env:LOCALAPPDATA\IsolatedOpenVPNGateway\bin;$env:Path"
+```
+
+Скопируйте выведенные установщиком две строки настройки PATH в это окно PowerShell, затем:
+
+```powershell
 vpn-gateway start --backend docker
 vpn-gateway test
 ```
 
 Docker Desktop должен работать с WSL2 backend, `desktop-linux` context и Linux containers. Windows containers и Hyper-V Manager не нужны.
+
+### Если команда `vpn-gateway` не найдена
+
+Это проверка PATH, а не состояния VPN. Установщик не меняет постоянный User/Machine PATH. В новом окне повторите выведенные им строки `$gatewayBin = ...` и `$env:Path = ...`, либо вызовите launcher по полному пути:
+
+```powershell
+& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status
+```
+
+Замените `ACTUAL-INSTALLED-ROOT` на фактическое значение `Installed:`. При packaged/MSIX-установке оно может находиться под `Packages\...\LocalCache`, а не непосредственно в `%LOCALAPPDATA%`. Оператор `&` обязателен перед путём в кавычках. Переустанавливать WSL или gateway из-за отсутствия команды в PATH не нужно; после закрытия окна session-only изменение PATH исчезает.
 
 ## macOS
 

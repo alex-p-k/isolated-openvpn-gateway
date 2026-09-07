@@ -140,6 +140,64 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(release.installer.InstallError):
             release.build(package, self.base/'bad.zip')
 
+class WindowsShellInstructionTests(unittest.TestCase):
+    def test_resolved_root_and_call_operator_for_each_backend(self):
+        root = Path('C:/Users/Test User/Packages/App/LocalCache/Local/IsolatedOpenVPNGateway')
+        for backend in ('docker', 'wsl'):
+            with self.subTest(backend=backend):
+                lines = installer.windows_shell_instructions(root, backend)
+                command = "& '" + str(root/'bin'/'vpn-gateway.cmd') + "'"
+                self.assertIn(command + ' start --backend ' + backend, lines)
+                self.assertEqual(command + ' install --backend wsl' in lines, backend == 'wsl')
+                self.assertIn("$gatewayBin = '" + str(root/'bin') + "'", lines)
+                self.assertNotIn('LOCALAPPDATA', '\n'.join(lines))
+                self.assertNotIn('setx', '\n'.join(lines).lower())
+                self.assertIn("$env:Path = $gatewayBin + ';' + $env:Path", lines)
+
+    def test_quotes_and_dollar_signs_are_literal_data(self):
+        root = Path("C:/Users/O'Brien $name/IsolatedOpenVPNGateway")
+        lines = installer.windows_shell_instructions(root, 'wsl')
+        quoted = "'" + str(root/'bin').replace("'", "''") + "'"
+        self.assertIn('$gatewayBin = ' + quoted, lines)
+        self.assertIn("O''Brien $name", '\n'.join(lines))
+
+    def test_invalid_backend_and_control_characters_are_rejected(self):
+        with self.assertRaises(installer.InstallError):
+            installer.windows_shell_instructions(Path('gateway'), 'unknown')
+        for character in ('\n', '\r', '\x00'):
+            with self.subTest(character=repr(character)), self.assertRaises(installer.InstallError):
+                installer.windows_shell_instructions('gateway'+character+'path', 'wsl')
+
+    @unittest.skipUnless(os.name == 'nt', 'Actual Windows PowerShell launcher test')
+    def test_actual_powershell_resolves_short_command_after_session_only_setup(self):
+        with tempfile.TemporaryDirectory(prefix='gateway-shell-test-') as temporary:
+            root = Path(temporary)/"Test O'Brien $name"/'IsolatedOpenVPNGateway'
+            (root/'bin').mkdir(parents=True)
+            launcher = root/'bin'/'vpn-gateway.cmd'
+            launcher.write_bytes(b'@echo off\r\necho SYNTHETIC-LAUNCHER-OK %1\r\n')
+            lines = installer.windows_shell_instructions(root, 'docker')
+            setup = [line for line in lines if line.startswith(('$gatewayBin =', '$env:Path ='))]
+            full_path_status = next(line for line in lines if line.startswith('& ')).rsplit(' start --backend ', 1)[0] + ' status'
+            # Execute only the fake status launcher, never install/start or real WSL.
+            script = '\n'.join([
+                "$ErrorActionPreference='Stop'",
+                "$beforeUser=[Environment]::GetEnvironmentVariable('Path','User')",
+                "$beforeMachine=[Environment]::GetEnvironmentVariable('Path','Machine')",
+                full_path_status,
+                'if ($LASTEXITCODE -ne 0) { exit 1 }',
+                *setup,
+                'vpn-gateway status',
+                'if ($LASTEXITCODE -ne 0) { exit 1 }',
+                "if ([Environment]::GetEnvironmentVariable('Path','User') -cne $beforeUser) { exit 2 }",
+                "if ([Environment]::GetEnvironmentVariable('Path','Machine') -cne $beforeMachine) { exit 3 }",
+            ])
+            output = subprocess.run([gateway.POWERSHELL, '-NoLogo', '-NoProfile',
+                '-NonInteractive', '-Command', script], capture_output=True, text=True,
+                timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.assertEqual(output.returncode, 0, output.stderr)
+            self.assertEqual(output.stdout.count('SYNTHETIC-LAUNCHER-OK status'), 2)
+
+
 class GitTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='gateway-git-test-')

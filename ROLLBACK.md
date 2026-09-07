@@ -84,6 +84,8 @@ The WSL auth file lives only at `/run/isolated-openvpn-gateway/auth` mode `0600`
 
 ## Post-rollback checks
 
+The installer's Windows command-name setup changes only `$env:Path` in the current PowerShell process. Close that window to discard it; User/Machine PATH, registry and PowerShell profiles are not modified. Closing the shell does not itself stop the separately running gateway. To stop explicitly without PATH setup, use `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' stop` with the actual `Installed:` root, including any packaged-terminal redirection.
+
 After stop/uninstall/rollback, confirm:
 
 1. `127.0.0.1:1080` is not listening.

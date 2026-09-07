@@ -129,7 +129,11 @@ Windows PowerShell, Docker-free WSL backend:
 ```powershell
 py -3.11 .\install.py --check --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
 py -3.11 .\install.py         --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
-$env:Path = "$env:LOCALAPPDATA\IsolatedOpenVPNGateway\bin;$env:Path"
+```
+
+Copy the two PowerShell PATH setup lines printed by the installer, which use the actual `Installed:` root. They apply only to that terminal window. Then run:
+
+```powershell
 vpn-gateway install --backend wsl
 vpn-gateway start --backend wsl
 ```
@@ -143,7 +147,7 @@ Installation paths:
 | macOS | `~/.local/share/isolated-openvpn-gateway` | `~/.local/bin/vpn-gateway`, `vpn-browser` | `~/.local/share/isolated-openvpn-browser` |
 | Windows | `%LOCALAPPDATA%\IsolatedOpenVPNGateway` | `...\bin\vpn-gateway.cmd`, `vpn-browser.cmd` | `%LOCALAPPDATA%\IsolatedOpenVPNBrowser` |
 
-No command is added to a global PATH. `--profiles-dir` resolves `profile_file`; repeated `--profile NAME=PATH` supports separate private directories.
+No command is added to a persistent User or Machine PATH. If PowerShell reports `vpn-gateway` is not recognized, repeat the installer's two session-only PATH setup lines in that window, or invoke the full launcher path with `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status`. Quoting a path alone does not execute it in PowerShell. Packaged-terminal installations may have a physical root under `Packages\...\LocalCache`; use the returned path instead of reconstructing it from `%LOCALAPPDATA%`. `--profiles-dir` resolves `profile_file`; repeated `--profile NAME=PATH` supports separate private directories.
 
 ## Commands and backend choice
 
@@ -221,4 +225,4 @@ The console-free WSL forwarder update was applied after the clone finished. The 
 
 After fixing a namespace-start race, the full installed WSL comparison completed on 2026-09-07. Both UDP transport keys passed all positive/negative controls, the final UDP session was restored and validated, and Windows IPv4/IPv6 DNS/routes, public IPv4 egress and global Git settings matched the initial comparison baseline. A subsequent private HTTPS request returned 302 with TLS verification enabled. The TCP443 attempt did not initialize: its configured HTTP-proxy endpoint timed out from both root WSL and the gateway namespace, while independent outer HTTPS controls passed in both. This is a real failed TCP attempt, not a successful TCP fail-closed test; the endpoint/path cause remains unresolved. Original profiles were not modified.
 
-Remote LAN-device and full uninstall acceptance remain incomplete. Docker Desktop was actually launched but failed before its Linux engine became available: its Ingest service could not remove a stale AF_UNIX socket (Windows error 1920). An owner-approved backup rename also failed; no socket, Docker data, ACL or service configuration was changed, and the working WSL session was preserved. No real Docker-backend acceptance was performed. macOS compatibility is covered by tests/mocks, not a real macOS run. See `WINDOWS.md` for the evidence boundaries.
+Remote LAN-device and full uninstall acceptance remain incomplete. Docker Desktop failed before its Linux engine became available. The owner's manual backup rename of the first blocked socket succeeded outside the agent session; a subsequent launch failed on a different Inference-manager socket. The owner explicitly deferred Docker acceptance and chose the existing WSL-only setup. Docker and its data remain installed; its repair is not required to use this working WSL gateway. No real Docker-backend acceptance was performed. macOS compatibility is covered by tests/mocks, not a real macOS run. See `WINDOWS.md` for the evidence boundaries.
