@@ -23,8 +23,12 @@ def stop(*_):
 def relay(client, command):
     process = None
     try:
+        # The detached forwarder has no console to inherit. Without this flag,
+        # Windows creates a visible console for every wsl.exe connection.
+        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, bufsize=0)
+                                   stderr=subprocess.DEVNULL, bufsize=0,
+                                   creationflags=creationflags)
 
         def copy_socket_to_process():
             try:
@@ -60,6 +64,9 @@ def relay(client, command):
                 process.wait(timeout=2)
             if process.poll() is None:
                 process.kill()
+                process.wait(timeout=2)
+        if process:
+            process.stdout.close()
 
 
 def serve(port, distro, pid_file):
