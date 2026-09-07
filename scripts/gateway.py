@@ -274,18 +274,28 @@ def powershell(command):
 def windows_network_commands():
     """Return read-only PowerShell diagnostics with stable, machine-readable output."""
     convert = '; ConvertTo-Json -Compress -Depth 6 -InputObject @($x)'
+    def query(command):
+        return powershell("$ErrorActionPreference='Stop'; " + command)
     return {
-        'dns': powershell("$x=Get-DnsClientServerAddress -AddressFamily IPv4 | "
+        'dns': query("$x=Get-DnsClientServerAddress -AddressFamily IPv4 | "
                           "Sort-Object InterfaceIndex | Select-Object InterfaceIndex,InterfaceAlias,ServerAddresses" + convert),
-        'routes': powershell("$x=Get-NetRoute -AddressFamily IPv4 | Where-Object {$_.Protocol -ne 'Local'} | "
+        'dns_ipv6': query("$x=Get-DnsClientServerAddress -AddressFamily IPv6 | "
+                          "Sort-Object InterfaceIndex | Select-Object InterfaceIndex,InterfaceAlias,ServerAddresses" + convert),
+        'routes': query("$x=Get-NetRoute -AddressFamily IPv4 | Where-Object {$_.Protocol -ne 'Local'} | "
                              "Sort-Object DestinationPrefix,InterfaceIndex,NextHop | "
                              "Select-Object DestinationPrefix,NextHop,InterfaceIndex,InterfaceAlias,RouteMetric,Protocol" + convert),
-        'default': powershell("$x=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | "
+        'routes_ipv6': query("$x=Get-NetRoute -AddressFamily IPv6 | Where-Object {$_.Protocol -ne 'Local'} | "
+                             "Sort-Object DestinationPrefix,InterfaceIndex,NextHop | "
+                             "Select-Object DestinationPrefix,NextHop,InterfaceIndex,InterfaceAlias,RouteMetric,Protocol" + convert),
+        'default': query("$x=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | "
                               "Sort-Object RouteMetric,InterfaceMetric | "
                               "Select-Object InterfaceIndex,InterfaceAlias,NextHop,RouteMetric,InterfaceMetric" + convert),
-        'public_route': powershell("$x=Find-NetRoute -RemoteIPAddress 1.1.1.1 | "
+        'default_ipv6': query("$x=Get-NetRoute -AddressFamily IPv6 | Where-Object {$_.DestinationPrefix -eq '::/0'} | "
+                              "Sort-Object RouteMetric,InterfaceMetric | "
+                              "Select-Object InterfaceIndex,InterfaceAlias,NextHop,RouteMetric,InterfaceMetric" + convert),
+        'public_route': query("$x=Find-NetRoute -RemoteIPAddress 1.1.1.1 | "
                                    "Select-Object InterfaceIndex,InterfaceAlias,NextHop,RouteMetric" + convert),
-        'adapters': powershell("$x=Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+        'adapters': query("$x=Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
                                "Sort-Object ifIndex | Select-Object Name,InterfaceDescription,ifIndex,Status" + convert),
         'git_global_proxy': ['git','config','--global','--get-regexp',
                              r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$'],
@@ -301,7 +311,16 @@ def network_snapshot():
     for key, cmd in commands.items():
         r = run(cmd, check=False)
         data[key] = {'code':r.returncode, 'stdout':r.stdout, 'stderr':r.stderr}
-    data['diagnostics_ok'] = all(data[key]['code'] == 0 for key in ('dns','routes','default','public_route'))
+    required = ('dns','routes','default','public_route')
+    if host.IS_WINDOWS:
+        required += ('dns_ipv6','routes_ipv6','default_ipv6','adapters')
+    data['diagnostics_ok'] = all(data[key]['code'] == 0 for key in required)
+    if host.IS_WINDOWS:
+        try:
+            data['diagnostics_ok'] = data['diagnostics_ok'] and all(
+                isinstance(json.loads(data[key]['stdout']), list) for key in required)
+        except (TypeError, ValueError):
+            data['diagnostics_ok'] = False
     if host.IS_WINDOWS:
         data['static_routes'] = data['routes']['stdout'].strip()
         data['public_route_signature'] = data['public_route']['stdout'].strip()
@@ -345,13 +364,19 @@ def windows_outer_route_matches(snapshot, matchers):
     return False
 
 def compare_host(before, after):
-    return {'host_diagnostics_available':before.get('diagnostics_ok') is True and after.get('diagnostics_ok') is True,
+    result = {'host_diagnostics_available':before.get('diagnostics_ok') is True and after.get('diagnostics_ok') is True,
             'host_dns_preserved': before['dns'] == after['dns'],
             'host_default_route_preserved':before['default'] == after['default'],
             'host_static_routes_preserved':before['static_routes'] == after['static_routes'],
             'host_public_route_preserved':before['public_route_signature'] == after['public_route_signature'],
             'host_outer_ip_preserved':bool(before['public_ip']) and before['public_ip'] == after['public_ip'],
             'global_git_proxy_preserved':before['git_global_proxy'] == after['git_global_proxy']}
+    if host.IS_WINDOWS:
+        for name in ('dns','routes','default'):
+            old, new = before.get(name+'_ipv6'), after.get(name+'_ipv6')
+            result['host_ipv6_'+name+'_preserved'] = (
+                isinstance(old, dict) and old.get('code') == 0 and old == new)
+    return result
 
 def engine():
     result = docker('info','--format','{{.OSType}}',check=False)
@@ -982,6 +1007,8 @@ def validation(target=None, backend='docker'):
                 'socks_handshake','loopback_publish_only','proxy_route_tun0','tun0_exists','forced_eth0_blocked')
     if selected == 'wsl':
         critical += ('fail_closed_firewall_installed',)
+    if host.IS_WINDOWS:
+        critical += ('host_ipv6_dns_preserved','host_ipv6_routes_preserved','host_ipv6_default_preserved')
     result['passed'] = all(result.get(key) is True for key in critical)
     if state.get('dns'):
         result['passed'] = result['passed'] and result['private_dns_via_socks']

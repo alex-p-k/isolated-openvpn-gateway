@@ -229,6 +229,54 @@ class WindowsGatewayTests(unittest.TestCase):
         after = dict(before); after['default'] = {'stdout':'wifi'}
         self.assertFalse(gateway.compare_host(before, after)['host_default_route_preserved'])
 
+    def test_windows_comparison_requires_successful_ipv6_dns_and_routes(self):
+        base = {'diagnostics_ok':True, 'dns':{}, 'default':{}, 'static_routes':[],
+                'public_route_signature':'vpn', 'public_ip':'203.0.113.5', 'git_global_proxy':{}}
+        for key in ('dns_ipv6','routes_ipv6','default_ipv6'):
+            base[key] = {'code':0,'stdout':'[]','stderr':''}
+        with patch.object(gateway.host, 'IS_WINDOWS', True):
+            self.assertTrue(all(gateway.compare_host(base, base).values()))
+            for field in ('dns','routes','default'):
+                key, result_key = field+'_ipv6', 'host_ipv6_'+field+'_preserved'
+                for change in ('missing','changed','failed'):
+                    with self.subTest(field=field, change=change):
+                        before, after = dict(base), dict(base)
+                        if change == 'missing':
+                            before.pop(key)
+                        elif change == 'changed':
+                            after[key] = {'code':0,'stdout':'[{"changed":true}]','stderr':''}
+                        else:
+                            before[key] = after[key] = {'code':1,'stdout':'','stderr':'failure'}
+                        self.assertFalse(gateway.compare_host(before, after)[result_key])
+
+    def test_macos_comparison_does_not_require_windows_ipv6_diagnostics(self):
+        base = {'diagnostics_ok':True, 'dns':{}, 'default':{}, 'static_routes':[],
+                'public_route_signature':'vpn', 'public_ip':'203.0.113.5', 'git_global_proxy':{}}
+        with patch.object(gateway.host, 'IS_WINDOWS', False):
+            result = gateway.compare_host(base, base)
+        self.assertTrue(all(result.values()))
+        self.assertFalse(any('ipv6' in key for key in result))
+
+    def test_windows_snapshot_rejects_failed_or_malformed_ipv6_diagnostics(self):
+        for issue in ('exit-code','bad-json'):
+            def response(command, **kwargs):
+                bad = 'Get-NetRoute -AddressFamily IPv6' in str(command)
+                return SimpleNamespace(returncode=1 if bad and issue == 'exit-code' else 0,
+                                       stdout='not-json' if bad and issue == 'bad-json' else '[]', stderr='')
+            with self.subTest(issue=issue), patch.object(gateway.host, 'IS_WINDOWS', True), \
+                 patch.object(gateway, 'public_ip', return_value='203.0.113.5'), \
+                 patch.object(gateway, 'run', side_effect=response):
+                self.assertFalse(gateway.network_snapshot()['diagnostics_ok'])
+
+    @unittest.skipUnless(gateway.host.IS_WINDOWS, 'requires real Windows IPv6 networking cmdlets')
+    def test_real_windows_ipv6_queries_are_read_only_json_arrays(self):
+        import json
+        commands = gateway.windows_network_commands()
+        for key in ('dns_ipv6','routes_ipv6','default_ipv6'):
+            with self.subTest(key=key):
+                response = gateway.run(commands[key], creationflags=gateway.subprocess.CREATE_NO_WINDOW, timeout=15)
+                self.assertIsInstance(json.loads(response.stdout), list)
+
     def test_windows_outer_adapter_and_matching_egress_pass_preflight(self):
         snapshot = {'public_ip':'203.0.113.10','diagnostics_ok':True,
                     'adapters':{'stdout':'[{"Name":"Outer VPN","InterfaceDescription":"Wintun",'
