@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import shutil
 import signal
+import select
 import subprocess
 import sys
 import time
@@ -258,11 +259,36 @@ def put(path, limit):
     private_write(path, data)
 
 
+def process_matches(path, value):
+    """A stale PID must not authorize signals to an unrelated Linux process."""
+    expected = {
+        NETNS_PID: (['/usr/bin/sleep', 'infinity'], NETNS_PATH),
+        SLIRP_PID: (['/usr/bin/slirp4netns', '--configure', '--mtu=65520',
+                     '--disable-host-loopback', '--cidr=10.0.2.0/24',
+                     '--netns-type=path', str(NETNS_PATH), 'eth0'], Path('/proc/self/ns/net')),
+        VPN_PID: (['/usr/bin/python3', '-u', str(BASE/'vpn.py')], NETNS_PATH),
+        SOCKS_PID: (['/usr/sbin/runuser', '-u', 'proxyuser', '--',
+                     '/usr/bin/python3', '-u', str(BASE/'socks.py')], NETNS_PATH),
+    }.get(path)
+    if expected is None or type(value) is not int or value <= 1:
+        return False
+    arguments, namespace = expected
+    proc = Path('/proc') / str(value)
+    try:
+        if proc.stat().st_uid != 0:
+            return False
+        with (proc/'cmdline').open('rb') as stream:
+            command = stream.read(4097)
+        return (command == b'\x00'.join(os.fsencode(arg) for arg in arguments) + b'\x00'
+                and (proc/'ns/net').samefile(namespace))
+    except OSError:
+        return False
+
+
 def pid_alive(path):
     try:
         value = int(path.read_text())
-        os.kill(value, 0)
-        return value
+        return value if process_matches(path, value) else None
     except (OSError, ValueError):
         return None
 
@@ -270,18 +296,24 @@ def pid_alive(path):
 def kill_pid(path, *, keep_file=False):
     value = pid_alive(path)
     if value:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(value, signal.SIGTERM)
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            try:
-                os.kill(value, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.1)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(value, signal.SIGKILL)
+        if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise RuntimeError('safe WSL process cleanup requires Linux pidfd support')
+        descriptor = None
+        try:
+            # Pin the process before rechecking ownership. A later PID reuse
+            # cannot redirect TERM/KILL to another process, including at timeout.
+            descriptor = os.pidfd_open(value, 0)
+            if process_matches(path, value):
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                if not select.select([descriptor], [], [], 8)[0]:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    if not select.select([descriptor], [], [], 2)[0]:
+                        raise RuntimeError('managed WSL process did not exit')
+        except ProcessLookupError:
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
     if not keep_file:
         path.unlink(missing_ok=True)
 
@@ -322,20 +354,22 @@ def start():
 
 def stop(*, keep_auth=False, vpn_only=False):
     require_root()
-    if systemd_available():
-        units = ['isolated-openvpn-gateway-vpn.service'] if vpn_only else [
-            'isolated-openvpn-gateway-socks.service', 'isolated-openvpn-gateway-vpn.service']
-        run(['/usr/bin/systemctl', 'stop', *units], check=False)
-    else:
-        if not vpn_only:
-            kill_pid(SOCKS_PID)
-        kill_pid(VPN_PID)
-    if not vpn_only and NETNS_PATH.exists():
-        inside(['/usr/bin/python3', str(BASE/'vpn.py'), 'cleanup-keep-auth' if keep_auth else 'cleanup'],
-               env=dict(os.environ, **ENVIRONMENT), check=False)
-        network_stop()
-    if not keep_auth:
-        AUTH.unlink(missing_ok=True)
+    try:
+        if systemd_available():
+            units = ['isolated-openvpn-gateway-vpn.service'] if vpn_only else [
+                'isolated-openvpn-gateway-socks.service', 'isolated-openvpn-gateway-vpn.service']
+            run(['/usr/bin/systemctl', 'stop', *units], check=False)
+        else:
+            if not vpn_only:
+                kill_pid(SOCKS_PID)
+            kill_pid(VPN_PID)
+        if not vpn_only and NETNS_PATH.exists():
+            inside(['/usr/bin/python3', str(BASE/'vpn.py'), 'cleanup-keep-auth' if keep_auth else 'cleanup'],
+                   env=dict(os.environ, **ENVIRONMENT), check=False)
+            network_stop()
+    finally:
+        if not keep_auth:
+            AUTH.unlink(missing_ok=True)
 
 
 def status():

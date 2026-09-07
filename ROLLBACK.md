@@ -82,6 +82,8 @@ vpn-gateway stop
 
 The WSL auth file lives only at `/run/isolated-openvpn-gateway/auth` mode `0600`; Docker uses the protected Windows runtime auth file. SSD/NTFS/ext4 cannot promise forensic secure erasure, so short lifetime and restrictive ACL/mode are the protection. Rotate credentials through the organization's normal process if exposure is suspected.
 
+Linux PID files alone are not proof that a process still belongs to the gateway. Cleanup checks the exact expected command, root ownership and the appropriate network namespace, rejecting init/group IDs and unrelated reused PIDs. Signals use a pinned [Linux pidfd](https://docs.python.org/3/library/os.html#os.pidfd_open), including timeout escalation, with no numeric-PID kill fallback. Missing pidfd support or denied process access is an explicit cleanup error; normal `stop` still removes its auth file in `finally`. Controlled comparison remains the only `keep_auth` exception. Do not bypass a cleanup error by killing arbitrary PIDs or all WSL processes.
+
 ## Post-rollback checks
 
 The installer's Windows command-name setup changes only `$env:Path` in the current PowerShell process. Close that window to discard it; User/Machine PATH, registry and PowerShell profiles are not modified. Closing the shell does not itself stop the separately running gateway. To stop explicitly without PATH setup, use `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' stop` with the actual `Installed:` root, including any packaged-terminal redirection.
