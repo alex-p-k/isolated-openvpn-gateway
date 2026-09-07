@@ -887,15 +887,38 @@ def start_transport(transport, timeout=100, backend='docker'):
     logs()
     return False
 
+def sanitized_events(backend='docker', lines=45):
+    """Read only the selected backend's bounded sanitized log, never raw output.
+
+    WSL keeps this log across starts; its history is not per-transport evidence.
+    Log access failure is recorded separately and cannot invent a VPN result.
+    """
+    if type(lines) is not int or not 1 <= lines <= 200:
+        raise ValueError('Expected a log tail limit from 1 to 200 lines.')
+    selected = backend_name(backend)
+    result = {'available': False, 'text': '', 'tail_lines': lines,
+              'scope': 'backend_history' if selected == 'wsl' else 'current_start'}
+    try:
+        if selected == 'wsl':
+            output = wsl('/usr/bin/tail', '-n', str(lines),
+                         '/var/lib/isolated-openvpn-gateway/state/safe.log',
+                         check=False, timeout=20)
+            if output.returncode:
+                return result
+            text = output.stdout
+        else:
+            text = (STATE/'safe.log').read_text(encoding='utf-8', errors='replace')
+        result.update(available=True, text='\n'.join(text.splitlines()[-lines:]))
+    except (OSError, subprocess.SubprocessError):
+        # Do not save exception text, argv, stderr or private endpoint details.
+        pass
+    return result
+
+
 def logs(backend='docker'):
-    if backend_name(backend) == 'wsl':
-        result = wsl('/usr/bin/tail', '-n', '45', '/var/lib/isolated-openvpn-gateway/state/safe.log',
-                     check=False, timeout=20)
-        print(result.stdout.strip() if result.returncode == 0 and result.stdout.strip()
-              else 'No sanitized WSL VPN events yet.')
-        return
-    path = STATE/'safe.log'
-    print('\n'.join(path.read_text().splitlines()[-45:]) if path.exists() else 'No sanitized VPN events yet.')
+    events = sanitized_events(backend)
+    print(events['text'] if events['available'] and events['text']
+          else 'No sanitized VPN events available for the selected backend.')
 
 def status(backend='docker'):
     selected_backend = backend_name(backend)
@@ -1154,7 +1177,9 @@ def compare_transports(backend='docker'):
                     checkpoint('transport_negative_test', transport)
                     row['failure_test'] = failure_test(selected_backend)
                     row['usable'] = failure_evidence_passed(row['failure_test'], selected_backend)
-            row['events'] = (STATE/'safe.log').read_text() if (STATE/'safe.log').exists() else ''
+            events = sanitized_events(selected_backend, lines=200)
+            row['events'] = events['text']
+            row['event_log'] = {key: value for key, value in events.items() if key != 'text'}
             checkpoint('transport_stop', transport)
             stop_internal(keep_auth=True, backend=selected_backend)
         checkpoint('selection')

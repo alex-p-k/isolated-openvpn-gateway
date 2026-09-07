@@ -61,6 +61,8 @@ class PureWslTests(unittest.TestCase):
              patch.object(gateway, 'configuration', return_value={'transports':{'udp':{},'tcp':{}}}), \
              patch.object(gateway, 'start_transport', return_value=False) as start, \
              patch.object(gateway, 'wsl_status_data', return_value={}), \
+             patch.object(gateway, 'sanitized_events', return_value={
+                 'available': False, 'text': '', 'tail_lines': 200, 'scope': 'backend_history'}), \
              patch.object(gateway, 'private_write'):
             with self.assertRaisesRegex(gateway.GatewayError, 'outer unavailable'):
                 gateway.compare_transports('wsl')

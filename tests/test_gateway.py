@@ -251,6 +251,8 @@ class TransportComparisonTests(unittest.TestCase):
             'save_preferences': None, 'validation': {'passed': True},
             'failure_test': self.evidence, 'network_snapshot': {},
             'compare_host': {'host_diagnostics_available': True, 'host_dns_preserved': True},
+            'sanitized_events': {'available': True, 'text': 'synthetic event',
+                                 'tail_lines': 200, 'scope': 'backend_history'},
         }
         self.calls = {name: stack.enter_context(patch.object(gateway, name, return_value=value))
                       for name, value in defaults.items()}
@@ -393,6 +395,25 @@ class TransportComparisonTests(unittest.TestCase):
         self.assertTrue(self.saved['comparison.json']['completed'])
         self.calls['wsl_status_data'].assert_not_called()
         self.calls['stop_internal'].assert_called_with(keep_auth=True, backend='docker')
+        self.assertEqual(self.calls['sanitized_events'].call_count, 2)
+        self.calls['sanitized_events'].assert_called_with('docker', lines=200)
+
+    def test_wsl_comparison_records_selected_backend_history_scope(self):
+        gateway.compare_transports('wsl')
+        for row in self.saved['transports.json'].values():
+            self.assertEqual(row['events'], 'synthetic event')
+            self.assertEqual(row['event_log'], {'available': True, 'tail_lines': 200,
+                                               'scope': 'backend_history'})
+        self.calls['sanitized_events'].assert_called_with('wsl', lines=200)
+
+    def test_missing_log_is_explicit_and_does_not_invent_transport_failure(self):
+        self.calls['sanitized_events'].return_value = {
+            'available': False, 'text': '', 'tail_lines': 200, 'scope': 'backend_history'}
+        gateway.compare_transports('wsl')
+        for row in self.saved['transports.json'].values():
+            self.assertEqual(row['events'], '')
+            self.assertFalse(row['event_log']['available'])
+            self.assertTrue(row['usable'])
 
     def test_outer_path_change_during_credentials_blocks_first_transport(self):
         self.calls['preflight'].side_effect = [{}, gateway.GatewayError('outer mismatch')]
@@ -412,6 +433,70 @@ class TransportComparisonTests(unittest.TestCase):
         self.calls['start_transport'].side_effect = lambda *args, **kwargs: events.append('start') or True
         gateway.compare_transports('wsl')
         self.assertEqual(events[:4], ['preflight', 'credentials', 'preflight', 'start'])
+
+
+class SanitizedEventTests(unittest.TestCase):
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.root = pathlib.Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        stack.enter_context(patch.object(gateway, 'STATE', self.root))
+        stack.enter_context(patch.object(gateway, 'backend_name', side_effect=lambda backend: backend))
+        stack.enter_context(patch.object(gateway, 'run', side_effect=AssertionError('Unexpected real command')))
+
+    def test_wsl_reads_only_managed_linux_log_even_if_docker_log_exists(self):
+        (self.root/'safe.log').write_text('unrelated Docker event')
+        output = subprocess.CompletedProcess([], 0, 'older\nfirst\nsecond\n', '')
+        with patch.object(gateway, 'wsl', return_value=output) as wsl:
+            result = gateway.sanitized_events('wsl', lines=2)
+        wsl.assert_called_once_with('/usr/bin/tail', '-n', '2',
+            '/var/lib/isolated-openvpn-gateway/state/safe.log', check=False, timeout=20)
+        self.assertEqual(result, {'available': True, 'text': 'first\nsecond',
+                                 'tail_lines': 2, 'scope': 'backend_history'})
+
+    def test_docker_reads_current_start_without_wsl_on_macos(self):
+        (self.root/'safe.log').write_text('older\nfirst\nsecond\n', encoding='utf-8')
+        with patch.object(gateway.host, 'IS_WINDOWS', False), patch.object(gateway, 'wsl') as wsl:
+            result = gateway.sanitized_events('docker', lines=2)
+        wsl.assert_not_called()
+        self.assertEqual(result, {'available': True, 'text': 'first\nsecond',
+                                 'tail_lines': 2, 'scope': 'current_start'})
+
+    def test_wsl_log_error_never_falls_back_to_docker_or_emits_stderr(self):
+        (self.root/'safe.log').write_text('unrelated Docker event')
+        output = subprocess.CompletedProcess([], 1, 'SYNTHETIC-PRIVATE', 'SYNTHETIC-PRIVATE')
+        with patch.object(gateway, 'wsl', return_value=output):
+            result = gateway.sanitized_events('wsl')
+        self.assertFalse(result['available'])
+        self.assertEqual(result['text'], '')
+        self.assertNotIn('SYNTHETIC-PRIVATE', json.dumps(result))
+
+    def test_log_timeout_does_not_save_command_or_exception_text(self):
+        failure = subprocess.TimeoutExpired(['SYNTHETIC-PRIVATE'], 20,
+                                            output='SYNTHETIC-PRIVATE', stderr='SYNTHETIC-PRIVATE')
+        with patch.object(gateway, 'wsl', side_effect=failure):
+            result = gateway.sanitized_events('wsl')
+        self.assertFalse(result['available'])
+        self.assertNotIn('SYNTHETIC-PRIVATE', json.dumps(result))
+
+    def test_empty_local_log_is_distinct_from_unavailable(self):
+        self.assertFalse(gateway.sanitized_events('docker')['available'])
+        (self.root/'safe.log').write_text('')
+        result = gateway.sanitized_events('docker')
+        self.assertTrue(result['available'])
+        self.assertEqual(result['text'], '')
+
+    def test_tail_limit_rejects_unbounded_or_noninteger_requests(self):
+        for value in (0, 201, -1, True, '45', 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                gateway.sanitized_events('wsl', lines=value)
+
+    def test_logs_uses_the_same_selected_backend_reader(self):
+        with patch.object(gateway, 'sanitized_events', return_value={
+                'available': True, 'text': 'sanitized fixture'}) as read, patch('builtins.print') as output:
+            gateway.logs('wsl')
+        read.assert_called_once_with('wsl')
+        output.assert_called_once_with('sanitized fixture')
 
 
 class InteractiveStartPreflightTests(unittest.TestCase):
