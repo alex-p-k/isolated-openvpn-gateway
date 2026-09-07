@@ -51,6 +51,10 @@ def configuration():
         raise GatewayError(str(exc)) from None
 
 def run(args, *, check=True, timeout=40, capture=True, env=None, **kwargs):
+    if str(args[0]).casefold() == str(POWERSHELL).casefold() and '-Command' in args:
+        # powershell() explicitly writes UTF-8; do not decode it using the
+        # current Windows ANSI locale (which may differ from the console).
+        kwargs.setdefault('encoding', 'utf-8')
     if capture and str(args[0]).lower().endswith(('wsl.exe', '/wsl')) and '--exec' not in args:
         result = subprocess.run([str(x) for x in args], env=ENV if env is None else env,
                                 capture_output=True, timeout=timeout, **kwargs)
@@ -262,7 +266,10 @@ def public_ip(proxy=False):
         return None
 
 def powershell(command):
-    return [POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command]
+    # A detached child has no console code page to inherit. Keep JSON names
+    # identical in interactive launchers, background checks, and native locales.
+    prefix = '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); '
+    return [POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', prefix + command]
 
 def windows_network_commands():
     """Return read-only PowerShell diagnostics with stable, machine-readable output."""

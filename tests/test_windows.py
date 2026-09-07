@@ -176,6 +176,26 @@ class WindowsInstallerTests(unittest.TestCase):
 
 
 class WindowsGatewayTests(unittest.TestCase):
+    def test_powershell_output_and_decoder_use_explicit_utf8(self):
+        completed = SimpleNamespace(returncode=0, stdout='ready', stderr='')
+        command = gateway.powershell("Write-Output 'ready'")
+        self.assertIn('[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)', command[-1])
+        with patch.object(gateway.subprocess, 'run', return_value=completed) as run:
+            gateway.run(command)
+        self.assertEqual(run.call_args.kwargs['encoding'], 'utf-8')
+
+    @unittest.skipUnless(gateway.host.IS_WINDOWS, 'requires real Windows PowerShell encoding')
+    def test_real_windows_unicode_json_is_identical_without_a_console(self):
+        import json
+        expected = 'Test \u0416\u043b\u044e\u0437 \u65e5\u672c\u8a9e'
+        command = gateway.powershell("@{Alias='" + expected + "'} | ConvertTo-Json -Compress")
+        outputs = []
+        for flags in (0, gateway.subprocess.CREATE_NO_WINDOW):
+            response = gateway.run(command, creationflags=flags, timeout=15)
+            self.assertEqual(json.loads(response.stdout), {'Alias':expected})
+            outputs.append(response.stdout)
+        self.assertEqual(outputs[0], outputs[1])
+
     def setUp(self):
         config = dict(CONFIG)
         config['windows_outer_adapter_contains'] = ['Outer VPN']
