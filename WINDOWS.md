@@ -204,7 +204,15 @@ Get-NetTCPConnection -State Listen -LocalPort 1080 |
 Test-NetConnection 127.0.0.1 -Port 1080
 ```
 
-There must be an IPv4 `127.0.0.1` listener and no `0.0.0.0`, LAN-address or IPv6 `::` listener. The acceptance script also tries every preferred non-loopback local IPv4 address and requires failure.
+There must be an IPv4 `127.0.0.1` listener and no `0.0.0.0`, LAN-address or IPv6 `::` listener. The acceptance script tries every preferred non-loopback local IPv4 and IPv6 address (including the scope ID for IPv6 link-local addresses), as well as `::1`, and requires failure. Temporary loopback listeners on automatically allocated ports first prove that each address-family probe can detect a successful connection; both controls are closed in `finally`. An unavailable IPv6 probe does not count as a passing negative test. No Firewall rules are changed.
+
+To check the live listener without requesting credentials, restarting or stopping the gateway:
+
+```powershell
+.\tools\windows_acceptance.ps1 -ListenerOnly
+```
+
+This reports booleans/counts, not interface addresses. It verifies local exposure only, not access from another LAN device, corporate payloads or tunnel-loss behavior; use the full acceptance flow for those separate checks.
 
 No `netsh portproxy` is created. Windows Firewall is not weakened globally or locally.
 
@@ -343,4 +351,6 @@ Host snapshots before and after the connected tests confirmed Windows DNS, defau
 
 A subsequent interactive start passed again. The user-supplied private task-tracker URL returned HTTPS 302 through SOCKS with TLS certificate validation enabled; host preservation and gateway validation still passed. A direct SOCKS domain-name request received the corporate Git server's SSH banner. Fixing the stdio bridge to use `read1` for short packets removed the Git timeout; SSH then failed authentication, and the HTTPS read-only attempt also required credentials. No keys were added, TLS/host-key checks were not bypassed, and no repository was cloned or pushed. The separate Chrome profile was launched, but automatic UI inspection stopped because computer-use could not confidently identify the current URL. Visual browser behavior and browser failure with the gateway off remain unverified.
 
-A Docker CLI (29.7.2, context `desktop-linux`) is now present, but the Docker Linux engine is not running. Actual Docker-backend, authenticated private Git/browser, TCP transport, remote LAN-device and full uninstall acceptance remain incomplete. Existing macOS behavior is tested with mocks on Windows, not an actual macOS machine. The automated suite runs 96 tests: 94 pass and 2 platform-specific cases are skipped on Windows. Automated tests cannot substitute for missing network checks. Diagnostic JSON and private deployment inputs remain outside Git.
+The non-disruptive listener acceptance also passed on the live corporate connection: the IPv4 and IPv6 positive controls worked, SOCKS accepted IPv4 loopback, and connections failed on three preferred non-loopback IPv4 addresses, two preferred non-loopback IPv6 addresses and `::1`. The temporary controls were removed without stopping OpenVPN. This is a real local-interface test, not a remote LAN-device test.
+
+A Docker CLI (29.7.2, context `desktop-linux`) is now present, but the Docker Linux engine is not running. Actual Docker-backend, authenticated private Git/browser, TCP transport, remote LAN-device and full uninstall acceptance remain incomplete. Existing macOS behavior is tested with mocks on Windows, not an actual macOS machine. The automated suite runs 97 tests: 95 pass and 2 platform-specific cases are skipped on Windows. It includes actual Windows IPv4/IPv6 TCP probe controls; that additional Windows-only case is skipped on macOS/Linux. Automated tests cannot substitute for missing network checks. Diagnostic JSON and private deployment inputs remain outside Git.

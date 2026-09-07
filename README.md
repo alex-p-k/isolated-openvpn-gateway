@@ -186,6 +186,8 @@ No global Git proxy, global SSH `ProxyCommand`, remote URL or repository content
 
 Run `vpn-gateway test` after connecting. On Windows, run `tools\windows_acceptance.ps1` on the target Home machine for real positive/negative and host-preservation evidence. Unit tests and mocks do not prove real VPN behavior.
 
+`tools\windows_acceptance.ps1 -ListenerOnly` checks the running Windows listener without stopping the gateway. It requires working IPv4/IPv6 loopback positive controls and blocked connections on non-loopback local addresses. This limited check does not replace corporate payload, tunnel-loss, or remote LAN-device tests.
+
 `vpn-gateway uninstall --backend wsl` unregisters only a distro whose Windows and Linux ownership markers both match this installation. Full uninstall removes only project-owned containers/image tags, managed WSL distro, launchers, copied private files, runtime state and matching repository-local Git changes. Docker Desktop, WSL itself, other distros, outer VPN software, repositories, host routes/DNS/Firewall and global Git settings remain.
 
 See `WINDOWS.md` for acceptance and NAT/mirrored handling, `ROLLBACK.md` for exact recovery boundaries, `QUICKSTART.md` for short commands and `HANDOFF.md` for safe transfer.

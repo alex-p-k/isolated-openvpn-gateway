@@ -3,7 +3,8 @@ param(
     [ValidateSet('docker','wsl')][string]$Backend = 'docker',
     [string]$GatewayCommand = "$env:LOCALAPPDATA\IsolatedOpenVPNGateway\bin\vpn-gateway.cmd",
     [string[]]$OuterAdapterContains = @(),
-    [string]$PrivateUrl = ''
+    [string]$PrivateUrl = '',
+    [switch]$ListenerOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,11 +41,69 @@ function Get-DnsFingerprint {
 }
 
 function Test-Tcp([string]$Address, [int]$Port) {
-    $client = [System.Net.Sockets.TcpClient]::new()
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse($Address, [ref]$ip)) {
+        throw 'Listener probes require a numeric IP address; no host DNS lookup is permitted.'
+    }
+    $client = [System.Net.Sockets.TcpClient]::new($ip.AddressFamily)
     try {
-        $wait = $client.ConnectAsync($Address, $Port)
+        $wait = $client.ConnectAsync($ip, $Port)
         return $wait.Wait(1500) -and $client.Connected
     } catch { return $false } finally { $client.Dispose() }
+}
+
+function Test-TcpControl([string]$Address) {
+    $ip = [Net.IPAddress]::Parse($Address)
+    if (-not [Net.IPAddress]::IsLoopback($ip)) { throw 'Probe controls must bind only to loopback.' }
+    $listener = [Net.Sockets.TcpListener]::new($ip, 0)
+    try {
+        $listener.Start()
+        return Test-Tcp $Address $listener.LocalEndpoint.Port
+    } catch { return $false } finally { $listener.Stop() }
+}
+
+function Get-SocksListenerEvidence {
+    $ipv4Control = Test-TcpControl '127.0.0.1'
+    $ipv6Control = Test-TcpControl '::1'
+    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort 1080 -ErrorAction SilentlyContinue)
+    $loopbackOnly = $listeners.Count -gt 0 -and @($listeners | Where-Object LocalAddress -ne '127.0.0.1').Count -eq 0
+    $tcpConnected = Test-Tcp '127.0.0.1' 1080
+    $ipv6LoopbackBlocked = -not (Test-Tcp '::1' 1080)
+    $ipv4Count = 0
+    $ipv6Count = 0
+    $reachable = 0
+    $seen = @{}
+    foreach ($item in @(Get-NetIPAddress | Where-Object AddressState -eq 'Preferred')) {
+        $ip = [Net.IPAddress]::Parse($item.IPAddress)
+        if ([Net.IPAddress]::IsLoopback($ip)) { continue }
+        if ($ip.IsIPv6LinkLocal) { $ip.ScopeId = [long]$item.InterfaceIndex }
+        $address = $ip.ToString()
+        if ($seen.ContainsKey($address)) { continue }
+        $seen[$address] = $true
+        if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $ipv4Count++ }
+        else { $ipv6Count++ }
+        if (Test-Tcp $address 1080) { $reachable++ }
+    }
+    return [pscustomobject]@{
+        LoopbackOnly = $loopbackOnly
+        SocksTcpConnected = $tcpConnected
+        Ipv4ProbeControlPassed = $ipv4Control
+        Ipv6ProbeControlPassed = $ipv6Control
+        Ipv6LoopbackBlocked = $ipv6LoopbackBlocked
+        Ipv4NonloopbackAddressesTested = $ipv4Count
+        Ipv6NonloopbackAddressesTested = $ipv6Count
+        LocalNonloopbackAddressesBlocked = $reachable -eq 0
+        RemoteLanDeviceTested = $false
+        Passed = $loopbackOnly -and $tcpConnected -and $ipv4Control -and $ipv6Control -and
+            $ipv6LoopbackBlocked -and $reachable -eq 0
+    }
+}
+
+if ($ListenerOnly) {
+    $evidence = Get-SocksListenerEvidence
+    $evidence | ConvertTo-Json
+    if (-not $evidence.Passed) { exit 1 }
+    exit 0
 }
 
 $os = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
@@ -128,13 +187,10 @@ if ($PrivateUrl) {
 }
 if ($LASTEXITCODE -ne 0) { throw 'Gateway validation failed.' }
 
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort 1080 -ErrorAction SilentlyContinue)
-$loopbackOnly = $listeners.Count -gt 0 -and @($listeners | Where-Object LocalAddress -ne '127.0.0.1').Count -eq 0
-$lanAddresses = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-    $_.IPAddress -ne '127.0.0.1' -and $_.AddressState -eq 'Preferred'
-} | ForEach-Object IPAddress)
-$lanBlocked = @($lanAddresses | Where-Object { Test-Tcp $_ 1080 }).Count -eq 0
-if (-not $loopbackOnly -or -not $lanBlocked) { throw 'SOCKS listener is not proven loopback-only.' }
+$listenerEvidence = Get-SocksListenerEvidence
+$loopbackOnly = $listenerEvidence.LoopbackOnly
+$lanBlocked = $listenerEvidence.LocalNonloopbackAddressesBlocked
+if (-not $listenerEvidence.Passed) { throw 'SOCKS listener is not proven loopback-only with working IPv4/IPv6 probes.' }
 } finally {
     & $GatewayCommand stop --backend $Backend
     if ($LASTEXITCODE -ne 0) { throw 'Gateway stop/credential cleanup failed.' }
@@ -170,6 +226,12 @@ $socksStopped = -not (Test-Tcp '127.0.0.1' 1080)
     SocksLoopbackOnly = $loopbackOnly
     SocksUnavailableAfterStop = $socksStopped
     LanAddressesBlocked = $lanBlocked
+    Ipv4ProbeControlPassed = $listenerEvidence.Ipv4ProbeControlPassed
+    Ipv6ProbeControlPassed = $listenerEvidence.Ipv6ProbeControlPassed
+    Ipv6LoopbackBlocked = $listenerEvidence.Ipv6LoopbackBlocked
+    Ipv4NonloopbackAddressesTested = $listenerEvidence.Ipv4NonloopbackAddressesTested
+    Ipv6NonloopbackAddressesTested = $listenerEvidence.Ipv6NonloopbackAddressesTested
+    RemoteLanDeviceTested = $false
     RealPositiveAndNegativeTest = $true
 } | Format-List
 if ($beforeRoutes -ne $afterRoutes -or $beforeDns -ne $afterDns -or

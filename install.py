@@ -22,7 +22,7 @@ PACKAGE_FILES = (
     'scripts/browser.py', 'scripts/socks_connect.py', 'scripts/wsl_backend.py',
     'scripts/wsl_manager.py', 'scripts/wsl_dependencies.py', 'scripts/wsl_bridge.py', 'scripts/loopback_forwarder.py',
     'scripts/wsl_sockd.conf', 'tests/test_gateway.py', 'tests/test_wsl.py',
-    'tests/test_install.py', 'tests/test_windows.py', 'tools/build_release.py',
+    'tests/test_install.py', 'tests/test_windows.py', 'tests/test_listener_windows.py', 'tools/build_release.py',
     'tools/windows_acceptance.ps1',
 )
 INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
