@@ -12,6 +12,8 @@ import signal
 import subprocess
 import sys
 import time
+import ipaddress
+import socket
 
 
 PROJECT = 'isolated-openvpn-gateway'
@@ -25,6 +27,8 @@ OWNER = ETC / 'ownership.json'
 VPN_PID = RUN / 'vpn.pid'
 SOCKS_PID = RUN / 'socks.pid'
 NETNS = 'isolated-openvpn-gateway'
+NETNS_ETC = Path('/etc/netns') / NETNS
+INNER_RESOLV = NETNS_ETC / 'resolv.conf'
 NETNS_PATH = Path('/run/netns') / NETNS
 NETNS_PID = RUN / 'netns.pid'
 SLIRP_PID = RUN / 'slirp.pid'
@@ -39,6 +43,7 @@ ENVIRONMENT = {
     'GATEWAY_RESOLV_CONF': '/etc/resolv.conf',
     'GATEWAY_OUTER_RESOLV': '/etc/isolated-openvpn-gateway/resolv.outer',
     'GATEWAY_SOCKD_CONFIG': '/etc/isolated-openvpn-gateway/sockd.conf',
+    'GATEWAY_SOCKD_BINARY': '/usr/sbin/danted',
 }
 
 
@@ -51,6 +56,7 @@ Wants=network-online.target
 Type=simple
 UMask=0077
 NetworkNamespacePath=/run/netns/isolated-openvpn-gateway
+BindPaths=/etc/netns/isolated-openvpn-gateway/resolv.conf:/etc/resolv.conf
 Environment=GATEWAY_BACKEND=wsl
 Environment=GATEWAY_STATE=/var/lib/isolated-openvpn-gateway/state
 Environment=GATEWAY_CONFIG=/etc/isolated-openvpn-gateway/client.ovpn
@@ -71,14 +77,17 @@ WantedBy=multi-user.target
 SOCKS_UNIT = '''[Unit]
 Description=Isolated OpenVPN Gateway loopback SOCKS
 After=isolated-openvpn-gateway-vpn.service
-Requires=isolated-openvpn-gateway-vpn.service
 
 [Service]
 Type=simple
 UMask=0077
 NetworkNamespacePath=/run/netns/isolated-openvpn-gateway
+BindReadOnlyPaths=/etc/netns/isolated-openvpn-gateway/resolv.conf:/etc/resolv.conf
 Environment=GATEWAY_STATE=/var/lib/isolated-openvpn-gateway/state
 Environment=GATEWAY_SOCKD_CONFIG=/etc/isolated-openvpn-gateway/sockd.conf
+Environment=GATEWAY_SOCKD_BINARY=/usr/sbin/danted
+User=proxyuser
+Group=proxyuser
 ExecStart=/usr/bin/python3 -u /opt/isolated-openvpn-gateway/socks.py
 Restart=no
 KillMode=control-group
@@ -179,7 +188,7 @@ def network_start():
 def restore_resolver(kind):
     source = ETC / ('resolv.' + kind)
     if source.is_file():
-        private_write('/etc/resolv.conf', source.read_bytes(), 0o644)
+        private_write(INNER_RESOLV, source.read_bytes(), 0o644)
 
 
 def ensure_proxy_user():
@@ -203,7 +212,7 @@ def ensure_proxy_user():
 
 def provision():
     require_root()
-    required = ('/usr/sbin/openvpn', '/usr/sbin/sockd', '/usr/sbin/iptables',
+    required = ('/usr/sbin/openvpn', '/usr/sbin/danted', '/usr/sbin/iptables',
                 '/usr/sbin/ip6tables', '/usr/sbin/ip', '/usr/bin/curl', '/usr/bin/python3',
                 '/usr/bin/slirp4netns', '/usr/bin/sleep', '/usr/sbin/runuser')
     if any(not Path(item).is_file() for item in required):
@@ -217,18 +226,22 @@ def provision():
     for directory in (BASE, ETC, RUN, STATE):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
+    for directory in (BASE, ETC, STATE):
+        os.chown(directory, 0, 10000)
+        directory.chmod(0o750)
+    run(['/usr/bin/systemctl', 'disable', '--now', 'danted.service'], check=False)
     private_write(OWNER, (json.dumps({'project': PROJECT, 'managed': True}) + '\n').encode())
     private_write(ETC/'resolv.host', original_resolver, 0o644)
     outer_text = b'nameserver 10.0.2.3\noptions timeout:2 attempts:2\n'
     private_write(ETC/'resolv.outer', outer_text, 0o644)
+    NETNS_ETC.mkdir(mode=0o755, parents=True, exist_ok=True)
+    private_write(INNER_RESOLV, outer_text, 0o644)
     private_write('/etc/systemd/system/isolated-openvpn-gateway-vpn.service', VPN_UNIT.encode(), 0o644)
     private_write('/etc/systemd/system/isolated-openvpn-gateway-socks.service', SOCKS_UNIT.encode(), 0o644)
     # This is per-distribution configuration. The host-wide .wslconfig is untouched.
-    private_write('/etc/wsl.conf', b'[boot]\nsystemd=true\n[network]\ngenerateResolvConf=false\n[user]\ndefault=root\n', 0o644)
-    resolv = Path('/etc/resolv.conf')
-    if resolv.is_symlink():
-        resolv.unlink()
-    private_write(resolv, original_resolver, 0o644)
+    # Keep WSL DNS tunneling intact for the outer slirp process. Only gateway
+    # processes see the bind-mounted namespace resolver (also under systemd).
+    private_write('/etc/wsl.conf', b'[boot]\nsystemd=true\n[network]\ngenerateResolvConf=true\n[user]\ndefault=root\n', 0o644)
     run(['/usr/bin/systemctl', 'daemon-reload'], check=False)
     print(json.dumps({'project': PROJECT, 'tun': True, 'systemd': systemd_available()}))
 
@@ -282,6 +295,7 @@ def fallback_start():
         private_write(VPN_PID, (str(process.pid) + '\n').encode())
     if not pid_alive(SOCKS_PID):
         process = subprocess.Popen(['/usr/sbin/ip', 'netns', 'exec', NETNS,
+                                    '/usr/sbin/runuser', '-u', 'proxyuser', '--',
                                     '/usr/bin/python3', '-u', str(BASE/'socks.py')],
                                    env=environment, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -315,7 +329,8 @@ def stop(*, keep_auth=False, vpn_only=False):
             kill_pid(SOCKS_PID)
         kill_pid(VPN_PID)
     if not vpn_only and NETNS_PATH.exists():
-        inside(['/usr/bin/python3', str(BASE/'vpn.py'), 'cleanup'], check=False)
+        inside(['/usr/bin/python3', str(BASE/'vpn.py'), 'cleanup-keep-auth' if keep_auth else 'cleanup'],
+               env=dict(os.environ, **ENVIRONMENT), check=False)
         network_stop()
     if not keep_auth:
         AUTH.unlink(missing_ok=True)
@@ -331,8 +346,18 @@ def status():
     socks = inside(['/usr/bin/ss', '-H', '-lnt', 'sport', '=', ':11080'], check=False).stdout.strip() \
         if namespace else ''
     data.update(owned=owned(), systemd=systemd_available(), network_namespace=namespace,
-                tun_exists=tun_exists, auth_present=AUTH.is_file(), socks_loopback=socks)
+                tun_exists=tun_exists, auth_present=AUTH.is_file(), socks_loopback=socks,
+                openvpn_running=openvpn_running())
     print(json.dumps(data))
+
+
+def openvpn_running():
+    try:
+        pid = int((RUN/'openvpn.pid').read_text())
+        info = Path('/proc', str(pid), 'stat').read_text().split(') ', 1)
+        return info[0].endswith('(openvpn') and info[1].split()[0] != 'Z'
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def bridge():
@@ -344,22 +369,54 @@ def bridge():
 
 def network_egress():
     network_start()
-    result = inside(['/usr/bin/curl', '-4', '--noproxy', '*', '-fsS', '--max-time', '15',
-                     'https://api.ipify.org'], check=False)
+    result = inside(['/usr/bin/curl', '-4', '--noproxy', '*', '-fsS', '--max-time', '10',
+                     '--connect-timeout', '5', '--retry', '1', '--retry-delay', '1', '--retry-all-errors',
+                     'https://checkip.amazonaws.com'], check=False)
     if result.returncode:
         raise RuntimeError('isolated network namespace egress is unavailable')
     print(result.stdout.strip())
 
 
 def proxy_outer_test():
-    """Try the forbidden direct path as the real Dante UID in its namespace."""
+    """Prove the UID firewall, independently of the unreachable policy route."""
     if not network_ready():
         raise RuntimeError('isolated WSL network namespace is unavailable')
-    result = inside(['/usr/sbin/runuser', '-u', 'proxyuser', '--', '/usr/bin/curl',
-                     '--interface', 'eth0', '--noproxy', '*', '-sS', '-o', '/dev/null',
-                     '--connect-timeout', '3', '--max-time', '4',
-                     'http://1.1.1.1/cdn-cgi/trace'], check=False)
-    return result.returncode
+    # Use the same HTTPS service as preflight. A fixed HTTP canary may itself
+    # be blocked by the outer VPN, which cannot prove anything about our rules.
+    address = socket.getaddrinfo('checkip.amazonaws.com', 443, socket.AF_INET,
+                                 socket.SOCK_STREAM)[0][4][0]
+    if not ipaddress.ip_address(address).is_global:
+        raise RuntimeError('public firewall canary resolved to a non-public address')
+    curl = ['/usr/bin/curl', '-4', '--interface', 'eth0', '--noproxy', '*', '-fsS',
+            '--resolve', 'checkip.amazonaws.com:443:' + address, '-o', '/dev/null',
+            '--connect-timeout', '4', '--max-time', '6', 'https://checkip.amazonaws.com']
+    control = inside(curl, check=False).returncode == 0
+    evidence = {'outer_control_succeeded':control, 'proxy_outer_blocked':False,
+                'firewall_reject_observed':False, 'probe_route_removed':False}
+    if control:
+        before = firewall_reject_count()
+        # This narrowly scoped probe bypasses table 100 ONLY for this UID and
+        # public canary. The firewall stays active; its counter must increase.
+        rule = ['priority', '95', 'to', address + '/32', 'uidrange', '10000-10000', 'lookup', 'main']
+        inside(['/usr/sbin/ip', 'rule', 'add', *rule])
+        try:
+            result = inside(['/usr/sbin/runuser', '-u', 'proxyuser', '--', *curl], check=False)
+            evidence['proxy_outer_blocked'] = result.returncode != 0
+            evidence['firewall_reject_observed'] = firewall_reject_count() > before
+        finally:
+            evidence['probe_route_removed'] = inside(
+                ['/usr/sbin/ip', 'rule', 'del', *rule], check=False).returncode == 0
+    print(json.dumps(evidence))
+    return 0
+
+
+def firewall_reject_count():
+    output = inside(['/usr/sbin/iptables', '-n', '-v', '-x', '-L', 'IOVG_WSL_PROXY']).stdout
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[2] == 'REJECT':
+            return int(fields[0])
+    raise RuntimeError('SOCKS firewall reject rule is missing')
 
 
 def remove_state():
@@ -370,7 +427,7 @@ def remove_state():
     for unit in ('isolated-openvpn-gateway-vpn.service', 'isolated-openvpn-gateway-socks.service'):
         Path('/etc/systemd/system', unit).unlink(missing_ok=True)
     run(['/usr/bin/systemctl', 'daemon-reload'], check=False)
-    for path in (STATE, RUN, ETC, BASE):
+    for path in (STATE, RUN, ETC, BASE, NETNS_ETC):
         if path.exists() and not path.is_symlink():
             shutil.rmtree(path)
 
@@ -389,6 +446,7 @@ def main(argv=None):
     elif action == 'bridge': bridge()
     elif action == 'start': start()
     elif action == 'stop': stop()
+    elif action == 'stop-keep-auth': stop(keep_auth=True)
     elif action == 'stop-vpn': stop(keep_auth=True, vpn_only=True)
     elif action == 'status': status()
     elif action == 'remove-state': remove_state()

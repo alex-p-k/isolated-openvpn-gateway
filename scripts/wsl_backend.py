@@ -16,6 +16,10 @@ MIN_WSL_VERSION = (2, 4, 4)
 
 def normalize_output(value):
     """Remove UTF-16 NUL artifacts produced by some inbox wsl.exe builds."""
+    if isinstance(value, bytes):
+        encoding = 'utf-16' if value.startswith((b'\xff\xfe', b'\xfe\xff')) else (
+            'utf-16-le' if b'\x00' in value else 'utf-8')
+        return value.decode(encoding, errors='replace').replace('\r', '')
     return str(value or '').replace('\x00', '').replace('\r', '')
 
 

@@ -48,8 +48,8 @@ def read_state():
         return {}
 
 def resolver(dns=(), domains=()):
-    # Docker updates a bind-mounted inode. The dedicated WSL distro owns its
-    # /etc/resolv.conf because provisioning disables per-distro regeneration.
+    # Update the existing bind-mounted inode. WSL binds only the gateway
+    # namespace's resolver; the outer distro retains WSL DNS tunneling.
     if dns:
         text = ''.join('nameserver ' + x + '\n' for x in dns)
         if domains:
@@ -285,6 +285,18 @@ def safe_line(line, secrets):
             line = line.replace(secret, '[REDACTED]')
     return line.strip()[:600]
 
+def hook_environment_options():
+    if BACKEND != 'wsl':
+        return []
+    options = []
+    for name, value in {'GATEWAY_BACKEND': BACKEND, 'GATEWAY_STATE': STATE,
+                        'GATEWAY_CONFIG': CONFIG, 'GATEWAY_AUTH': AUTH,
+                        'GATEWAY_RUNTIME': RUNTIME, 'GATEWAY_RESOLV_CONF': RESOLV,
+                        'GATEWAY_OUTER_RESOLV': OUTER_RESOLV}.items():
+        options += ['--setenv', name, str(value)]
+    return options
+
+
 def supervise():
     os.umask(0o077)
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -307,6 +319,9 @@ def supervise():
             '--route-pre-down', str(Path(__file__).resolve())+' hook', '--down', str(Path(__file__).resolve())+' hook',
             '--down-pre', '--up-restart', '--verb', '3', '--connect-retry-max', '2',
             '--connect-timeout', '12', '--ping', '10', '--ping-restart', '60']
+    # OpenVPN rebuilds its hook environment; ordinary inherited variables do
+    # not reliably reach route-up/down. These contain paths, never credentials.
+    args += hook_environment_options()
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     (RUNTIME/'openvpn.pid').write_text(str(proc.pid))
     def terminate(*_):
@@ -341,9 +356,10 @@ if __name__ == '__main__':
         sys.exit(run_hook())
     elif action == 'health':
         sys.exit(0 if healthy() else 1)
-    elif action == 'cleanup':
+    elif action in ('cleanup', 'cleanup-keep-auth'):
         cleanup_firewall()
-        AUTH.unlink(missing_ok=True)
+        if action == 'cleanup':
+            AUTH.unlink(missing_ok=True)
         sys.exit(0)
     else:
         try:

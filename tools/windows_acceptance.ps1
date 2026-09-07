@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Distro = 'IsolatedOpenVPNGateway'
-$IpUrl = 'https://api.ipify.org'
+$IpUrl = 'https://checkip.amazonaws.com'
 
 function Invoke-Text([scriptblock]$Action) {
     $value = & $Action 2>&1
@@ -17,7 +17,26 @@ function Invoke-Text([scriptblock]$Action) {
 }
 
 function Get-PublicIp {
-    return (curl.exe -4 --noproxy '*' --fail --silent --show-error --max-time 15 $IpUrl).Trim()
+    $value = Invoke-Text { curl.exe -4 --noproxy '*' --fail --silent --show-error --max-time 15 $IpUrl }
+    $address = $null
+    if (-not [Net.IPAddress]::TryParse($value, [ref]$address) -or
+        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+        throw 'Public IPv4 egress is unavailable.'
+    }
+    return $address.ToString()
+}
+
+function Get-RouteFingerprint {
+    return (Get-NetRoute | Where-Object Protocol -ne Local |
+        Select-Object AddressFamily,DestinationPrefix,InterfaceIndex,NextHop,RouteMetric,Protocol |
+        Sort-Object AddressFamily,DestinationPrefix,InterfaceIndex,NextHop |
+        ConvertTo-Json -Compress -Depth 5)
+}
+
+function Get-DnsFingerprint {
+    return (Get-DnsClientServerAddress |
+        Select-Object InterfaceIndex,AddressFamily,ServerAddresses |
+        Sort-Object InterfaceIndex,AddressFamily | ConvertTo-Json -Compress -Depth 5)
 }
 
 function Test-Tcp([string]$Address, [int]$Port) {
@@ -32,21 +51,30 @@ $os = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\Current
 $computer = Get-CimInstance Win32_ComputerSystem
 $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
 $editionHome = $os.EditionID -like 'Core*' -or $os.ProductName -like '* Home*'
-$beforeRoutes = Get-NetRoute -AddressFamily IPv4 | Where-Object Protocol -ne Local |
-    Sort-Object DestinationPrefix,InterfaceIndex,NextHop | ConvertTo-Json -Compress -Depth 5
-$beforeDns = Get-DnsClientServerAddress -AddressFamily IPv4 |
-    Sort-Object InterfaceIndex | Select-Object InterfaceIndex,ServerAddresses |
-    ConvertTo-Json -Compress -Depth 5
+$beforeRoutes = Get-RouteFingerprint
+$beforeDns = Get-DnsFingerprint
 $publicRoute = Find-NetRoute -RemoteIPAddress 1.1.1.1
 $upAdapters = Get-NetAdapter | Where-Object Status -eq Up
 $outerIndexes = @($upAdapters | Where-Object {
     $identity = "$($_.Name)`n$($_.InterfaceDescription)"
-    @($OuterAdapterContains | Where-Object { $identity -like "*$_*" }).Count -gt 0
+    @($OuterAdapterContains | Where-Object {
+        $identity.IndexOf($_,[StringComparison]::OrdinalIgnoreCase) -ge 0
+    }).Count -gt 0
 } | ForEach-Object ifIndex)
 
 $hostIp = Get-PublicIp
-$wslVersion = (& wsl.exe --version 2>&1 | Out-String).Trim()
-$wslList = (& wsl.exe --list --verbose 2>&1 | Out-String).Trim()
+$wslVersion = ''
+$wslList = ''
+$wslAvailable = $false
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    try {
+        $wslVersion = (& wsl.exe --version 2>&1 | Out-String).Replace([string][char]0,'').Trim()
+        $wslAvailable = $LASTEXITCODE -eq 0 -and $wslVersion -match 'WSL[^0-9]*[0-9]+\.'
+        $wslList = (& wsl.exe --list --verbose 2>&1 | Out-String).Replace([string][char]0,'').Trim()
+    } catch {
+        if ($Backend -eq 'wsl') { throw 'WSL diagnostics are unavailable.' }
+    }
+}
 $wslMode = 'nat'
 $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
 if (Test-Path -LiteralPath $wslConfig) {
@@ -60,6 +88,13 @@ $dockerOs = $null
 $backendIp = $null
 $systemd = $null
 $tun = $null
+$routeIndexes = @($publicRoute | ForEach-Object InterfaceIndex | Sort-Object -Unique)
+$routeMatchesOuter = $OuterAdapterContains.Count -gt 0 -and $routeIndexes.Count -gt 0 -and
+    @($routeIndexes | Where-Object { $outerIndexes -notcontains $_ }).Count -eq 0
+if (-not $routeMatchesOuter) { throw 'The selected Windows public route is not on the expected outer-VPN adapter.' }
+if (-not (Test-Path -LiteralPath $GatewayCommand -PathType Leaf)) { throw 'Installed vpn-gateway command not found.' }
+
+try {
 if ($Backend -eq 'docker') {
     $dockerVersion = Invoke-Text { docker.exe --context desktop-linux version --format '{{.Server.Version}}' }
     $dockerContext = Invoke-Text { docker.exe context show }
@@ -82,10 +117,7 @@ if ($Backend -eq 'docker') {
     }
 }
 
-$routeMatchesOuter = $OuterAdapterContains.Count -gt 0 -and $outerIndexes -contains $publicRoute.InterfaceIndex
-if (-not $routeMatchesOuter) { throw 'The selected Windows public route is not on the expected outer-VPN adapter.' }
 if ($backendIp -ne $hostIp) { throw 'BLOCKER: backend egress bypasses or differs from Windows outer-VPN egress.' }
-if (-not (Test-Path -LiteralPath $GatewayCommand -PathType Leaf)) { throw 'Installed vpn-gateway command not found.' }
 
 & $GatewayCommand compare-transports --backend $Backend
 if ($LASTEXITCODE -ne 0) { throw 'Positive/negative gateway transport acceptance failed.' }
@@ -103,15 +135,14 @@ $lanAddresses = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
 } | ForEach-Object IPAddress)
 $lanBlocked = @($lanAddresses | Where-Object { Test-Tcp $_ 1080 }).Count -eq 0
 if (-not $loopbackOnly -or -not $lanBlocked) { throw 'SOCKS listener is not proven loopback-only.' }
-
-& $GatewayCommand stop
-if ($LASTEXITCODE -ne 0) { throw 'Gateway stop failed.' }
-$afterRoutes = Get-NetRoute -AddressFamily IPv4 | Where-Object Protocol -ne Local |
-    Sort-Object DestinationPrefix,InterfaceIndex,NextHop | ConvertTo-Json -Compress -Depth 5
-$afterDns = Get-DnsClientServerAddress -AddressFamily IPv4 |
-    Sort-Object InterfaceIndex | Select-Object InterfaceIndex,ServerAddresses |
-    ConvertTo-Json -Compress -Depth 5
+} finally {
+    & $GatewayCommand stop --backend $Backend
+    if ($LASTEXITCODE -ne 0) { throw 'Gateway stop/credential cleanup failed.' }
+}
+$afterRoutes = Get-RouteFingerprint
+$afterDns = Get-DnsFingerprint
 $hostIpAfter = Get-PublicIp
+$socksStopped = -not (Test-Tcp '127.0.0.1' 1080)
 
 [pscustomobject]@{
     WindowsEdition = $os.ProductName
@@ -123,7 +154,7 @@ $hostIpAfter = Get-PublicIp
     RamGiB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 1)
     HypervisorPresent = $computer.HypervisorPresent
     VirtualizationFirmwareEnabled = $processor.VirtualizationFirmwareEnabled
-    WslVersionAvailable = [bool]$wslVersion
+    WslVersionAvailable = $wslAvailable
     WslManagedDistroPresent = $wslList -match [regex]::Escape($Distro)
     WslNetworkingMode = $wslMode
     SystemdAvailable = $systemd
@@ -137,7 +168,11 @@ $hostIpAfter = Get-PublicIp
     HostRoutesPreserved = $beforeRoutes -eq $afterRoutes
     HostDnsPreserved = $beforeDns -eq $afterDns
     SocksLoopbackOnly = $loopbackOnly
-    SocksUnavailableAfterStop = -not (Test-Tcp '127.0.0.1' 1080)
+    SocksUnavailableAfterStop = $socksStopped
     LanAddressesBlocked = $lanBlocked
     RealPositiveAndNegativeTest = $true
 } | Format-List
+if ($beforeRoutes -ne $afterRoutes -or $beforeDns -ne $afterDns -or
+    $hostIp -ne $hostIpAfter -or -not $socksStopped) {
+    throw 'Host preservation or post-stop isolation acceptance failed.'
+}

@@ -17,10 +17,10 @@ PACKAGE = Path(__file__).resolve().parent
 PACKAGE_FILES = (
     'VERSION', 'README.md', 'QUICKSTART.md', 'HANDOFF.md', 'ROLLBACK.md', 'MIGRATION.md', 'WINDOWS.md', 'install.py',
     'gateway.example.toml', 'compose.yaml', 'Dockerfile.vpn', 'Dockerfile.socks',
-    '.dockerignore', '.gitignore', 'scripts/gateway_config.py', 'scripts/host.py',
+    '.dockerignore', '.gitignore', '.gitattributes', 'scripts/gateway_config.py', 'scripts/host.py',
     'scripts/gateway.py', 'scripts/vpn.py', 'scripts/socks.py', 'scripts/sockd.conf',
     'scripts/browser.py', 'scripts/socks_connect.py', 'scripts/wsl_backend.py',
-    'scripts/wsl_manager.py', 'scripts/wsl_bridge.py', 'scripts/loopback_forwarder.py',
+    'scripts/wsl_manager.py', 'scripts/wsl_dependencies.py', 'scripts/wsl_bridge.py', 'scripts/loopback_forwarder.py',
     'scripts/wsl_sockd.conf', 'tests/test_gateway.py', 'tests/test_wsl.py',
     'tests/test_install.py', 'tests/test_windows.py', 'tools/build_release.py',
     'tools/windows_acceptance.ps1',
@@ -218,6 +218,10 @@ def install_files(package, target_home, profiles, python_executable, config_byte
         }
         write_private(root / 'installation.json', (json.dumps(metadata, indent=2) + '\n').encode(),
                       hostlib=hostlib, system=system)
+        if system == 'Windows':
+            metadata['resolved_install_root'] = str((root/'installation.json').resolve().parent)
+            hostlib.private_write(root/'installation.json', (json.dumps(metadata, indent=2)+'\n').encode(),
+                                  system=system)
         launchers = ((configlib.CLI, 'gateway.py'), (configlib.BROWSER_CLI, 'browser.py'))
         if system == 'Windows':
             for name, script in launchers:
@@ -247,7 +251,7 @@ def install_files(package, target_home, profiles, python_executable, config_byte
         if root.exists() and not root.is_symlink():
             shutil.rmtree(root)
         raise
-    return root
+    return (root/'installation.json').resolve().parent if system == 'Windows' else root
 
 
 def profile_arguments(values, configuration):

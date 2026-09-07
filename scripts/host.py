@@ -17,24 +17,60 @@ SYSTEM = platform.system()
 IS_WINDOWS = SYSTEM == 'Windows'
 
 
+def local_app_data(home, environ, *, native=False):
+    # Packaged Windows terminals can virtualize LOCALAPPDATA in child cmd.exe.
+    # The per-user Shell Folder is stable across the installer and launchers.
+    if native and IS_WINDOWS:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') as key:
+            value, _ = winreg.QueryValueEx(key, 'Local AppData')
+        return Path(os.path.expandvars(value))
+    return Path(environ.get('LOCALAPPDATA') or home/'AppData'/'Local')
+
+
 def install_root(home=None, environ=None, system=None):
+    native = home is None and environ is None
     home = Path.home() if home is None else Path(home)
     environ = os.environ if environ is None else environ
     system = SYSTEM if system is None else system
     if system == 'Windows':
-        base = Path(environ.get('LOCALAPPDATA') or home/'AppData'/'Local')
-        return base/'IsolatedOpenVPNGateway'
+        base = local_app_data(home, environ, native=native)
+        root = base/'IsolatedOpenVPNGateway'
+        if native and (root/'installation.json').is_file():
+            # File redirection can differ from directory redirection in MSIX.
+            return (root/'installation.json').resolve().parent
+        return root.resolve() if native else root
     return home/'.local'/'share'/'isolated-openvpn-gateway'
 
 
 def browser_root(home=None, environ=None, system=None):
+    native = home is None and environ is None
     home = Path.home() if home is None else Path(home)
     environ = os.environ if environ is None else environ
     system = SYSTEM if system is None else system
     if system == 'Windows':
-        base = Path(environ.get('LOCALAPPDATA') or home/'AppData'/'Local')
-        return base/'IsolatedOpenVPNBrowser'
+        base = local_app_data(home, environ, native=native)
+        root = base/'IsolatedOpenVPNBrowser'
+        if native and (root/'.isolated-openvpn-gateway-owned').is_file():
+            return (root/'.isolated-openvpn-gateway-owned').resolve().parent
+        return root.resolve() if native else root
     return home/'.local'/'share'/'isolated-openvpn-browser'
+
+
+def installation_root_matches(root, marker):
+    root = Path(root)
+    if root == install_root():
+        return True
+    # An MSIX installer may have redirected LocalAppData files. The recorded
+    # physical root must also work from an ordinary, non-packaged terminal.
+    if not IS_WINDOWS or root.name != 'IsolatedOpenVPNGateway' or root.is_symlink():
+        return False
+    recorded = marker.get('resolved_install_root')
+    if not isinstance(recorded, str) or Path(recorded) != root:
+        return False
+    base = local_app_data(Path.home(), os.environ, native=True)
+    return root.is_absolute() and root.is_relative_to(base)
 
 
 def command_directory(root, home=None, system=None):

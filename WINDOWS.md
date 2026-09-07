@@ -160,6 +160,7 @@ This command:
 2. refuses to adopt an existing unowned `IsolatedOpenVPNGateway` distro;
 3. installs a separate Debian distro under the protected gateway directory;
 4. installs OpenVPN, Dante, iproute2, iptables, `slirp4netns`, curl, certificates and Python inside it;
+   if the Debian release has no Dante package (including Debian 13), builds official Dante 1.4.4 with a pinned upstream SHA-256 using Debian's build tools, without adding another Debian release;
 5. creates a fixed UID `10000` for SOCKS;
 6. records matching Windows and Linux ownership markers;
 7. creates a nested Linux network namespace for OpenVPN/Dante/tun0/firewall, because Microsoft documents that WSL2 distros share their root network namespace;
@@ -225,6 +226,8 @@ vpn-gateway compare-transports --backend wsl
 ```
 
 For each transport it proves a SOCKS request succeeds first, stops only OpenVPN, verifies `tun0` disappears, verifies SOCKS fails and UID `10000` cannot force the original outer interface, then restores the connection. A missing connection without a positive control is not accepted as proof.
+
+For WSL, the firewall probe also requires a successful root control request through the same outer interface. A temporary rule directs only UID `10000`'s public canary request to the main table, independently of table 100's unreachable route. The request must fail and the dedicated firewall's REJECT counter must increase. The probe rule is removed in `finally`; the VPN restoration attempt also runs in `finally`. A failed diagnostic command, missing namespace, unchanged counter, failed control request or failed restoration is not a passing test.
 
 The Docker backend retains its independent container firewall, UID route and `tun0` Dante binding.
 
@@ -324,4 +327,12 @@ See `ROLLBACK.md` for ownership boundaries, `.wslconfig` recovery and manual ver
 
 ## Current verification limitation
 
-The development host was Windows 11 Home Single Language (`EditionID=CoreSingleLanguage`, 25H2, build `26200.9168`), AMD64, 31.8 GiB RAM, with SLAT and firmware virtualization enabled. WSL and Docker were not installed, and host public-IP DNS resolution was unavailable. This proves edition/host diagnostics only. It does not prove either backend, `/dev/net/tun`, outer-VPN inheritance, corporate OpenVPN, SOCKS fail-closed, DNS, Git or browser behavior on real networking. Those items remain incomplete until the acceptance script passes on a provisioned Home system.
+The development host is Windows 11 Home Single Language (`EditionID=CoreSingleLanguage`, 25H2, build `26200.9168`), AMD64, 31.8 GiB RAM. On 2026-09-07, after reboot, WSL 2.7.12 and the hypervisor were confirmed active. A separate Debian WSL2 distro was created and real checks confirmed systemd and `/dev/net/tun`.
+
+WSL NAT timed out reaching public services; this was unavailable egress, not evidence of a bypass. After the machine owner's separate approval, the originally absent `.wslconfig` was recorded for rollback, a minimal `networkingMode=mirrored` file was created and WSL was restarted. Windows, root WSL and the nested gateway namespace then returned the same public IPv4; Windows selected the configured outer VPN adapter. Provisioning completed, including verified upstream Dante 1.4.4. Windows routes, DNS and ordinary egress were unchanged across the infrastructure tests. Subsequent transient egress failures correctly blocked tests; later repetitions passed. Public egress diagnostics now allow one bounded retry for connection errors; a valid mismatching IP still blocks immediately. Mirrored mode is not a universal VPN compatibility guarantee.
+
+Real infrastructure checks passed: the root HTTPS outer control succeeded while SOCKS UID 10000 was rejected, the firewall counter increased, and the narrow test route was removed. A separate **synthetic** TUN test confirmed Dante configuration/startup and SOCKS handshake through the Windows loopback-only forwarder. `stop` removed the listener and credentials were absent. Corporate OpenVPN was never launched for these tests, so they do not prove corporate tunnel fail-closed operation. Linux assets and auth input are transferred as exact UTF-8 bytes to prevent Windows stdin CRLF conversion.
+
+The source-built Dante fallback is pinned, not managed by Debian security updates. Updating it requires reviewing a new upstream release/checksum and repeating the runtime tests; do not silently download an unpinned latest version. Ordinary Debian dependencies continue to use Debian packages.
+
+Docker is absent. Corporate OpenVPN initialization, full corporate SOCKS positive/negative tests, pushed corporate DNS, Git, browser and an actual remote LAN-device test remain unverified. Tests with mocks are not evidence that those network requirements work.

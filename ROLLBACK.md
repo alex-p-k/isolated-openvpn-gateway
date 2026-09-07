@@ -51,6 +51,8 @@ wsl.exe --shutdown
 
 If no file existed before the test, remove only the explicitly added `networkingMode=mirrored` line (and an otherwise empty `[wsl2]` section), then run `wsl --shutdown`. Do not replace an unknown `.wslconfig` wholesale. Repeat Windows/backend public-egress, route and DNS checks after rollback.
 
+Record the absent-file case explicitly rather than claiming a file backup exists. An automated rollback helper must refuse to delete the file if it contains any edits newer than the approved proposal. Gateway uninstall deliberately does not undo an owner-approved host-wide networking experiment: it may now be used by other WSL workloads.
+
 ## Failed WSL provisioning
 
 If `vpn-gateway install --backend wsl` created the distro in the same attempt and provisioning then failed, the command unregisters that newly created distro as transaction rollback and clears its Windows ownership metadata. It never unregisters a distro that existed before the attempt.

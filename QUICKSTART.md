@@ -24,6 +24,8 @@ vpn-browser https://private-host/
 
 Будет создан только выделенный дистрибутив `IsolatedOpenVPNGateway`. Docker не требуется; пользовательский Ubuntu/WSL не изменяется.
 
+В Debian 13 Dante собирается из официального исходника с проверкой SHA-256; установке нужен доступ к Debian и `www.inet.no`. При запуске из packaged/MSIX-приложения Windows может перенаправить LocalAppData: используйте фактический путь к `bin`, выведенный установщиком, а не угадывайте его. Успешный preflight проверяет внешний VPN до скрытого интерактивного ввода credentials; не передавайте пароль в командной строке или чате.
+
 ## Windows 11 Home/Pro — Docker Desktop Linux containers
 
 ```powershell

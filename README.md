@@ -134,7 +134,7 @@ vpn-gateway install --backend wsl
 vpn-gateway start --backend wsl
 ```
 
-The first WSL command creates only `IsolatedOpenVPNGateway`. It installs OpenVPN, Dante, iproute2, iptables, `slirp4netns`, curl and Python inside that distro. It does not install into the default distro and does not change the default distro.
+The first WSL command creates only `IsolatedOpenVPNGateway`. It installs OpenVPN, Dante, iproute2, iptables, `slirp4netns`, curl and Python inside that distro. It does not install into the default distro and does not change the default distro. Debian 13 does not ship Dante: the installer then builds official Dante 1.4.4 after verifying its pinned upstream SHA-256; it does not mix Debian releases. Network access to Debian and `www.inet.no` is needed for this fallback.
 
 Installation paths:
 
@@ -167,11 +167,11 @@ vpn-browser [https://private-host/]
 
 `backend set` changes only the saved future choice and never switches a running session. An explicit `--backend` overrides the saved choice for that command. `stop`, `status`, `logs` and `test` use the recorded active backend.
 
-`start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route/DNS hook succeeds, `tun0` exists and SOCKS5 handshake succeeds. `compare-transports` performs a positive control, stops only OpenVPN, proves the SOCKS request and forced outer-interface request fail, restores the session and selects the first fully usable transport.
+`start` succeeds only after OpenVPN reports `Initialization Sequence Completed`, the route/DNS hook succeeds, `tun0` exists and SOCKS5 handshake succeeds. `compare-transports` requires a successful SOCKS request before stopping OpenVPN and checking that proxy access fails. WSL additionally requires an outer-path positive control and an observed firewall REJECT-counter increase independently of the unreachable route. It attempts WSL session restoration even when a diagnostic raises an exception, then selects a transport only after all checks pass.
 
 ## Corporate DNS, Git and browser
 
-Pushed `dhcp-option DNS`, `DOMAIN` and `DOMAIN-SEARCH` are applied only to the Docker namespace or managed WSL distro. Disconnect restores the distro's pre-provisioning WSL resolver for public OpenVPN control traffic. Windows DNS, outer-VPN DNS, global NRPT and other WSL distros are untouched.
+Pushed `dhcp-option DNS`, `DOMAIN` and `DOMAIN-SEARCH` are applied only to the Docker namespace or the nested managed WSL namespace. WSL uses a namespace-specific resolver bind mount for both systemd and fallback processes. Disconnect restores the namespace's outer resolver; the distro's WSL-generated resolver stays intact for the outer `slirp4netns` process and DNS tunneling. Windows DNS, outer-VPN DNS, global NRPT and other WSL distros are untouched.
 
 Clients resolve target hostnames proxy-side:
 
@@ -203,4 +203,4 @@ See `WINDOWS.md` for acceptance and NAT/mirrored handling, `ROLLBACK.md` for exa
 
 ## Verification status of this revision
 
-The development host was identified as Windows 11 Home Single Language by `EditionID=CoreSingleLanguage`, display version `25H2` and build `26200.9168` (the legacy registry `ProductName` compatibility string still says Windows 10). It is AMD64 with 31.8 GiB RAM, SLAT and firmware virtualization enabled. WSL and Docker were not installed, and public-IP DNS resolution was unavailable. Therefore only host-edition diagnostics, source/static checks and platform-simulation tests ran here. Real Docker, WSL, OpenVPN, SOCKS positive/negative, corporate DNS, Git and browser acceptance remain explicitly unverified until `tools\windows_acceptance.ps1` passes on a fully provisioned Windows 11 Home target.
+The development host is Windows 11 Home Single Language, 25H2, build `26200.9168`, AMD64. On 2026-09-07, WSL 2.7.12, dedicated Debian WSL2, systemd, `/dev/net/tun`, OpenVPN and Dante 1.4.4 were installed/checked without Docker. NAT egress timed out; after separate owner approval and a recorded absent-file backup, mirrored mode passed Windows/root-WSL/nested-namespace egress equality and outer-adapter route checks. Infrastructure tests preserved Windows routes, DNS and egress. Real UID firewall positive/negative controls and a synthetic-TUN SOCKS handshake/loopback-listener smoke test passed. These are **not** corporate VPN acceptance: actual corporate authentication, SOCKS data through a corporate tunnel and its negative test, pushed DNS, Git and browser remain pending. Docker is absent; macOS compatibility is covered by mocks, not a real macOS run.

@@ -33,7 +33,7 @@ def main():
         marker = json.loads((ROOT/'installation.json').read_text())
     except (OSError, ValueError):
         pass
-    if marker.get('project') != PROJECT or ROOT != host.install_root():
+    if marker.get('project') != PROJECT or not host.installation_root_matches(ROOT, marker):
         command = host.command_directory(ROOT)/(BROWSER_CLI+'.cmd' if host.IS_WINDOWS else BROWSER_CLI)
         raise SystemExit('Run install.py first, then use '+str(command)+'.')
     try:

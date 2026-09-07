@@ -1,4 +1,5 @@
 import importlib.util
+import contextlib
 import io
 import json
 import os
@@ -24,12 +25,76 @@ def module(name, path):
 wsl_backend = module('test_wsl_backend', ROOT/'scripts'/'wsl_backend.py')
 gateway = module('test_wsl_gateway', ROOT/'scripts'/'gateway.py')
 vpn = module('test_wsl_vpn', ROOT/'scripts'/'vpn.py')
+if os.name == 'nt':
+    with patch.dict(sys.modules, {'pwd':SimpleNamespace()}):
+        manager_module = module('test_wsl_manager', ROOT/'scripts'/'wsl_manager.py')
+else:
+    manager_module = module('test_wsl_manager', ROOT/'scripts'/'wsl_manager.py')
 installer = module('test_wsl_installer', ROOT/'install.py')
 configlib = installer.config_module(ROOT)
 CONFIG = configlib.load_config(ROOT/'gateway.example.toml')
 
 
 class PureWslTests(unittest.TestCase):
+    def test_socks_greeting_handles_fragmented_reply(self):
+        with patch.object(gateway,'configuration',return_value=CONFIG), \
+             patch.object(gateway.socket,'create_connection') as connect:
+            stream = connect.return_value.__enter__.return_value
+            stream.recv.side_effect = [b'\x05', b'\x00']
+            self.assertTrue(gateway.socks_available())
+            stream.settimeout.assert_called_once_with(10)
+
+    def test_recorded_msix_root_works_outside_packaged_terminal_but_not_elsewhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base/'Packages'/'App'/'LocalCache'/'Local'/'IsolatedOpenVPNGateway'
+            with patch.object(gateway.host,'IS_WINDOWS',True), \
+                 patch.object(gateway.host,'install_root',return_value=base/'IsolatedOpenVPNGateway'), \
+                 patch.object(gateway.host,'local_app_data',return_value=base):
+                self.assertTrue(gateway.host.installation_root_matches(root,{'resolved_install_root':str(root)}))
+                self.assertFalse(gateway.host.installation_root_matches(root,{}))
+                outside = base.parent/'IsolatedOpenVPNGateway'
+                self.assertFalse(gateway.host.installation_root_matches(outside,{'resolved_install_root':str(outside)}))
+
+    def test_linux_stdin_is_binary_and_preserves_exact_lf(self):
+        completed = SimpleNamespace(returncode=0, stdout=b'ok\n', stderr=b'')
+        with patch.object(gateway.subprocess, 'run', return_value=completed) as run:
+            result = gateway.wsl('/usr/bin/python3','-c','pass',input='#!/usr/bin/python3\n')
+        self.assertIs(run.call_args.kwargs['text'],False)
+        self.assertNotIn('encoding',run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs['input'],b'#!/usr/bin/python3\n')
+        self.assertEqual(result.stdout,'ok\n')
+
+    def test_dante_checksum_mismatch_prevents_extraction(self):
+        dependencies = module('test_wsl_dependencies', ROOT/'scripts'/'wsl_dependencies.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp)/'source.tar.gz'
+            archive.write_bytes(b'untrusted download')
+            with patch.object(dependencies.tarfile, 'open') as extract:
+                with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                    dependencies.verified_extract(archive, Path(tmp))
+                extract.assert_not_called()
+
+    def test_packaged_windows_installation_uses_resolved_marker_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base/'IsolatedOpenVPNGateway'
+            root.mkdir()
+            marker = root/'installation.json'
+            marker.write_text('{}')
+            redirected = base/'package-cache'/'IsolatedOpenVPNGateway'
+            original_resolve = Path.resolve
+            def resolve(path, *args, **kwargs):
+                return redirected/'installation.json' if path == marker else original_resolve(path,*args,**kwargs)
+            with patch.object(gateway.host, 'local_app_data', return_value=base), \
+                 patch.object(Path, 'resolve', resolve):
+                self.assertEqual(gateway.host.install_root(system='Windows'), redirected)
+
+    def test_localized_wsl_bytes_decode_without_corrupting_output(self):
+        value = 'Версия WSL: 2.7.12.0\r\n'
+        self.assertEqual(wsl_backend.parse_version(value.encode('utf-16-le')), (2,7,12,0))
+        self.assertEqual(wsl_backend.normalize_output('Linux utf8'.encode()), 'Linux utf8')
+
     def test_windows_home_edition_detection(self):
         self.assertTrue(wsl_backend.edition_is_home('CoreSingleLanguage', 'Windows 11 Home'))
         self.assertTrue(wsl_backend.edition_is_home('Core', 'Windows 10'))
@@ -123,6 +188,87 @@ class RequirementIsolationTests(unittest.TestCase):
 
 
 class WslGatewayTests(unittest.TestCase):
+    def failure_probe(self, diagnostic):
+        stopped = {'network_namespace':True, 'openvpn_running':False, 'tun_exists':False}
+        with patch.object(gateway.host, 'IS_WINDOWS', True), \
+             patch.object(gateway, 'ready', return_value=True), \
+             patch.object(gateway, 'wsl_status_data', side_effect=({'dns':[]},stopped)), \
+             patch.object(gateway, 'public_ip', side_effect=('203.0.113.1',None,'203.0.113.1')), \
+             patch.object(gateway.time, 'sleep'), \
+             patch.object(gateway, 'wsl_manager', side_effect=(SimpleNamespace(returncode=0),diagnostic)), \
+             patch.object(gateway, 'restore_wsl_after_failure_test', return_value=True) as restore, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = gateway.failure_test('wsl')
+        restore.assert_called_once()
+        return result
+
+    def test_negative_probe_error_is_not_proof_of_firewall_blocking(self):
+        failed = SimpleNamespace(returncode=1, stdout='')
+        self.assertFalse(self.failure_probe(failed)['firewall_forced_outer_blocked'])
+        partial = SimpleNamespace(returncode=0, stdout=json.dumps({'proxy_outer_blocked':True}))
+        self.assertFalse(self.failure_probe(partial)['firewall_forced_outer_blocked'])
+
+    def test_negative_probe_requires_control_and_observed_firewall_reject(self):
+        evidence = {key:True for key in ('outer_control_succeeded','proxy_outer_blocked',
+                                        'firewall_reject_observed','probe_route_removed')}
+        for missing in (None, 'outer_control_succeeded', 'firewall_reject_observed', 'probe_route_removed'):
+            current = dict(evidence)
+            if missing: current[missing] = False
+            result = self.failure_probe(SimpleNamespace(returncode=0, stdout=json.dumps(current)))
+            self.assertEqual(result['firewall_forced_outer_blocked'], missing is None)
+            self.assertTrue(result['state_restored'])
+
+    def test_negative_probe_restores_tunnel_after_diagnostic_exception(self):
+        with patch.object(gateway.host, 'IS_WINDOWS', True), \
+             patch.object(gateway, 'ready', return_value=True), \
+             patch.object(gateway, 'wsl_status_data', return_value={'dns':[]}), \
+             patch.object(gateway, 'public_ip', return_value='203.0.113.1'), \
+             patch.object(gateway, 'wsl_manager', side_effect=gateway.GatewayError('diagnostic failed')), \
+             patch.object(gateway, 'restore_wsl_after_failure_test', return_value=True) as restore:
+            with self.assertRaisesRegex(gateway.GatewayError, 'diagnostic failed'):
+                gateway.failure_test('wsl')
+        restore.assert_called_once()
+
+    def test_incomplete_owned_distro_can_resume_without_reinstalling(self):
+        with patch.object(gateway.host, 'IS_WINDOWS', True), \
+             patch.object(gateway, 'wsl_version', return_value='WSL version: 2.7.12'), \
+             patch.object(gateway, 'wsl_names', return_value=[wsl_backend.DISTRO]), \
+             patch.object(gateway, 'wsl_owned', return_value=True), \
+             patch.object(gateway, 'read_json', return_value={'wsl_install_phase':'awaiting-network'}), \
+             patch.object(gateway, 'provision_wsl_backend') as provision, \
+             patch.object(gateway, 'run') as run:
+            gateway.install_backend('wsl')
+        provision.assert_called_once_with(gateway.ROOT/'wsl')
+        run.assert_not_called()
+
+    def test_linux_assets_have_lf_shebang_and_stdin_transfer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)/'hook with spaces.py'
+            source.write_bytes(b'#!/usr/bin/python3\r\nprint("ok")\r\n')
+            with patch.object(gateway, 'wsl') as invoke:
+                gateway.copy_wsl_asset(source, '/opt/project/hook.py')
+        args, kwargs = invoke.call_args
+        self.assertEqual(kwargs['input'], '#!/usr/bin/python3\nprint("ok")\n')
+        self.assertEqual(args[-2:], ('/opt/project/hook.py','0555'))
+        self.assertNotIn(str(source), args)
+
+    def test_comparison_stop_preserves_wsl_auth(self):
+        with patch.object(gateway.host, 'IS_WINDOWS', True), \
+             patch.object(gateway, 'stop_forwarder'), \
+             patch.object(gateway, 'wsl_names', return_value=[wsl_backend.DISTRO]), \
+             patch.object(gateway, 'wsl_owned', return_value=True), \
+             patch.object(gateway, 'wsl', return_value=SimpleNamespace(returncode=0)), \
+             patch.object(gateway, 'cleanup_auth') as cleanup, \
+             patch.object(gateway, 'wsl_manager', return_value=SimpleNamespace(returncode=0)) as manager:
+            gateway.stop_internal(keep_auth=True, backend='wsl')
+        cleanup.assert_not_called()
+        manager.assert_called_once_with('stop-keep-auth', check=False, timeout=35)
+
+    def test_public_ip_timeout_is_unavailable_not_an_unhandled_exception(self):
+        with patch.object(gateway, 'configuration', return_value=CONFIG), \
+             patch.object(gateway, 'run', side_effect=gateway.subprocess.TimeoutExpired('curl', 20)):
+            self.assertIsNone(gateway.public_ip())
+
     def test_outer_vpn_egress_mismatch_blocks_before_credentials(self):
         listing = SimpleNamespace(returncode=0,
                                   stdout='IsolatedOpenVPNGateway Running 2\n', stderr='')
@@ -148,10 +294,22 @@ class WslGatewayTests(unittest.TestCase):
             auth = Path(tmp)/'auth'; auth.write_text('secret')
             with patch.object(gateway, 'AUTH', auth), \
                  patch.object(gateway, 'wsl_names', return_value=[wsl_backend.DISTRO]), \
-                 patch.object(gateway, 'wsl_manager') as manager:
+                 patch.object(gateway, 'wsl_owned', return_value=True), \
+                 patch.object(gateway, 'wsl') as invoke:
                 gateway.cleanup_auth('wsl')
             self.assertFalse(auth.exists())
-            manager.assert_called_once_with('cleanup-auth', check=False, timeout=20)
+            invoke.assert_called_once_with('/usr/bin/rm','-f','/run/isolated-openvpn-gateway/auth',
+                                           check=False, timeout=20)
+
+    def test_credential_cleanup_does_not_modify_an_unowned_distro(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(gateway, 'AUTH', Path(tmp)/'absent'), \
+                 patch.object(gateway, 'wsl_names', return_value=[wsl_backend.DISTRO]), \
+                 patch.object(gateway, 'wsl_owned', return_value=False), \
+                 patch.object(gateway, 'wsl') as invoke:
+                with self.assertRaisesRegex(gateway.GatewayError, 'unowned'):
+                    gateway.cleanup_auth('wsl')
+        invoke.assert_not_called()
 
     def test_credentials_use_stdin_not_arguments_or_environment(self):
         completed = SimpleNamespace(returncode=0, stdout='', stderr='')
@@ -177,6 +335,72 @@ class WslGatewayTests(unittest.TestCase):
 
 
 class WslFirewallTests(unittest.TestCase):
+    def setUp(self):
+        resolver = patch.object(manager_module.socket, 'getaddrinfo',
+            return_value=[(2,1,6,'',('1.1.1.1',443))])
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
+    def test_namespace_resolver_does_not_replace_outer_wsl_dns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            etc = Path(tmp)
+            (etc/'resolv.outer').write_bytes(b'nameserver 10.0.2.3\n')
+            with patch.object(manager_module, 'ETC', etc), \
+                 patch.object(manager_module, 'private_write') as write:
+                manager_module.restore_resolver('outer')
+            self.assertEqual(write.call_args.args[0], manager_module.INNER_RESOLV)
+            self.assertNotEqual(write.call_args.args[0], Path('/etc/resolv.conf'))
+        self.assertIn('BindPaths=/etc/netns/', manager_module.VPN_UNIT)
+        self.assertIn('BindReadOnlyPaths=/etc/netns/', manager_module.SOCKS_UNIT)
+
+    def test_firewall_probe_restores_narrow_route_even_when_curl_raises(self):
+        commands = []
+        def inside(args, **kwargs):
+            commands.append(args)
+            if args[0] == '/usr/sbin/runuser':
+                raise OSError('diagnostic failed')
+            return SimpleNamespace(returncode=0, stdout='')
+        with patch.object(manager_module, 'network_ready', return_value=True), \
+             patch.object(manager_module, 'inside', side_effect=inside), \
+             patch.object(manager_module, 'firewall_reject_count', return_value=7):
+            with self.assertRaises(OSError):
+                manager_module.proxy_outer_test()
+        added = next(args for args in commands if args[:3] == ['/usr/sbin/ip','rule','add'])
+        deleted = next(args for args in commands if args[:3] == ['/usr/sbin/ip','rule','del'])
+        self.assertEqual(added[3:], deleted[3:])
+        self.assertIn('1.1.1.1/32', added)
+        self.assertIn('10000-10000', added)
+
+    def test_firewall_probe_requires_independent_positive_control_and_counter(self):
+        for outer_ok, counters, expected in ((True,[7,8],True),(True,[7,7],False),(False,[],False)):
+            commands = []
+            def inside(args, **kwargs):
+                commands.append(args)
+                code = 7 if args[0] == '/usr/sbin/runuser' or (
+                    args[0] == '/usr/bin/curl' and not outer_ok) else 0
+                return SimpleNamespace(returncode=code, stdout='')
+            output = io.StringIO()
+            with patch.object(manager_module, 'network_ready', return_value=True), \
+                 patch.object(manager_module, 'inside', side_effect=inside), \
+                 patch.object(manager_module, 'firewall_reject_count', side_effect=counters), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(manager_module.proxy_outer_test(),0)
+            self.assertEqual(all(json.loads(output.getvalue()).values()), expected)
+            if not outer_ok:
+                self.assertFalse(any(args[0] == '/usr/sbin/ip' for args in commands))
+
+    def test_wsl_hooks_receive_paths_after_openvpn_strips_environment(self):
+        with patch.object(vpn, 'BACKEND', 'wsl'):
+            options = vpn.hook_environment_options()
+        triples = [options[index:index+3] for index in range(0, len(options), 3)]
+        values = {item[1]:item[2] for item in triples}
+        self.assertTrue(all(item[0] == '--setenv' for item in triples))
+        self.assertEqual(values['GATEWAY_BACKEND'], 'wsl')
+        self.assertEqual(values['GATEWAY_STATE'], str(vpn.STATE))
+        self.assertEqual(values['GATEWAY_AUTH'], str(vpn.AUTH))
+        with patch.object(vpn, 'BACKEND', 'docker'):
+            self.assertEqual(vpn.hook_environment_options(), [])
+
     def test_wsl_firewall_is_idempotent_uid_scoped_and_has_no_global_policy(self):
         calls = []
 
@@ -226,7 +450,6 @@ class WslFirewallTests(unittest.TestCase):
         self.assertIn("'netns', 'exec', NETNS", manager)
         self.assertIn("elif action == 'proxy-outer-test': return proxy_outer_test()", manager)
         self.assertIn("forced=wsl_manager('proxy-outer-test'", gateway_source)
-        self.assertIn("tun_absent=not wsl_status_data().get('tun_exists')", gateway_source)
 
 
 if __name__ == '__main__':

@@ -68,7 +68,10 @@ def serve(port, distro, pid_file):
     command = ['wsl.exe', '--distribution', distro, '--user', 'root', '--exec',
                '/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', 'bridge']
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if os.name == 'nt':
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(('127.0.0.1', port))
     listener.listen(64)
     listener.settimeout(1)

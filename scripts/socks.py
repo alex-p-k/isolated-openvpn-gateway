@@ -19,6 +19,7 @@ signal.signal(signal.SIGINT, stop)
 generation = None
 state_path = pathlib.Path(os.environ.get('GATEWAY_STATE', '/state')) / 'status.json'
 sockd_config = os.environ.get('GATEWAY_SOCKD_CONFIG', '/etc/sockd.conf')
+sockd_binary = os.environ.get('GATEWAY_SOCKD_BINARY', '/usr/sbin/sockd')
 try:
     while running:
         try:
@@ -38,7 +39,7 @@ try:
             child = None
         if live and child is None:
             # No request/target logs or raw resolver errors are persisted.
-            child = subprocess.Popen(['/usr/sbin/sockd', '-f', sockd_config],
+            child = subprocess.Popen([sockd_binary, '-f', sockd_config],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             generation = new_generation
         time.sleep(0.5)

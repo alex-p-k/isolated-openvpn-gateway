@@ -49,6 +49,8 @@ Release строится по явному allowlist и не включает `g
 
 Не переносите состояние сессии. На новый компьютер устанавливаются только публичный движок и приватные deployment inputs; credentials вводит новый пользователь. Репозитории остаются обычными NTFS-папками и переносятся независимо.
 
+Для Debian 13 установщик собирает Dante 1.4.4 из официального исходника с проверкой закреплённого SHA-256 (в Debian 13 нет пакета `dante-server`). Нужен доступ к Debian и `www.inet.no`; смешивание stable/testing репозиториев не выполняется. Corporate DNS живёт только в bind-mounted resolver сетевого namespace шлюза, а внешний WSL resolver сохраняет DNS tunneling.
+
 ## Что не автоматизируется
 
 - изменение `%USERPROFILE%\.wslconfig`, NAT/mirrored mode, Windows Firewall, routes или DNS;
