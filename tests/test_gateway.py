@@ -224,4 +224,175 @@ class ContainerHookTests(unittest.TestCase):
         self.assertIn('nameserver 127.0.0.1',pathlib.Path('/state/resolv.conf').read_text())
         self.assertNotEqual(subprocess.run(['/sbin/ip','link','show','tun0'],capture_output=True).returncode,0)
 
+class TransportComparisonTests(unittest.TestCase):
+    """Lifecycle mocks, not real VPN/network acceptance evidence."""
+    evidence = {key: True for key in (
+        'openvpn_terminated', 'tun0_absent', 'proxy_request_verified_before_stop',
+        'socks_after_vpn_stop_blocked', 'firewall_forced_outer_blocked',
+        'host_still_online', 'state_restored')}
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        root = pathlib.Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        stack.enter_context(patch.object(gateway, 'ROOT', root))
+        stack.enter_context(patch.object(gateway, 'STATE', root/'state'))
+        stack.enter_context(patch('builtins.print'))
+        self.saved = {}
+        def write(path, value):
+            self.saved[path.name] = json.loads(value)
+        defaults = {
+            'backend_name': 'wsl', 'stop_internal': None, 'preflight': {},
+            'prompt_credentials': None, 'start_transport': True, 'ready': True,
+            'configuration': {'transports': {'udp': {}, 'tcp': {}}},
+            'wsl_status_data': {'initialization_completed': True},
+            'read_json': {'initialization_completed': True},
+            'preferences': {'backend': 'docker', 'default_transport': 'tcp'},
+            'save_preferences': None, 'validation': {'passed': True},
+            'failure_test': self.evidence, 'network_snapshot': {},
+            'compare_host': {'host_diagnostics_available': True, 'host_dns_preserved': True},
+        }
+        self.calls = {name: stack.enter_context(patch.object(gateway, name, return_value=value))
+                      for name, value in defaults.items()}
+        stack.enter_context(patch.object(gateway, 'private_write', side_effect=write))
+        # An accidentally unmocked command must not touch an installed backend.
+        stack.enter_context(patch.object(gateway, 'run', side_effect=AssertionError('Unexpected real command')))
+
+    def assert_aborted(self, phase):
+        report = self.saved['comparison.json']
+        self.assertFalse(report['completed'])
+        self.assertFalse(report['session_ready'])
+        self.assertTrue(report['cleanup_attempted'])
+        self.assertEqual(report['failure']['phase'], phase)
+        self.calls['stop_internal'].assert_called_with(backend='wsl')
+        self.calls['save_preferences'].assert_not_called()
+        return report
+
+    def test_false_final_validation_does_not_select_or_leave_ready_session(self):
+        self.calls['validation'].side_effect = [{'passed': True}, {'passed': True}, {'passed': False}]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('final_validation')
+        self.assertFalse(report['final_validation']['passed'])
+
+    def test_disappearing_final_session_cannot_pass(self):
+        self.calls['ready'].return_value = False
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.assert_aborted('final_validation')
+
+    def test_failed_repeat_start_cleans_up_without_selection(self):
+        self.calls['start_transport'].side_effect = [True, True, False]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.assert_aborted('final_start')
+
+    def test_missing_negative_evidence_is_not_vacuously_successful(self):
+        self.calls['failure_test'].return_value = {}
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.assert_aborted('selection')
+        self.assertFalse(any(row['usable'] for row in self.saved['transports.json'].values()))
+        self.assertEqual(self.calls['start_transport'].call_count, 2)
+
+    def test_each_negative_control_requires_an_actual_boolean(self):
+        for backend in ('docker', 'wsl'):
+            required = {key: value for key, value in self.evidence.items()
+                        if backend == 'wsl' or key != 'state_restored'}
+            self.assertTrue(gateway.failure_evidence_passed(required, backend))
+            self.assertFalse(gateway.failure_evidence_passed(None, backend))
+            self.assertFalse(gateway.failure_evidence_passed({}, backend))
+            for key in required:
+                for invalid in (False, None, 1, 'true'):
+                    with self.subTest(backend=backend, key=key, invalid=invalid):
+                        self.assertFalse(gateway.failure_evidence_passed(dict(required, **{key: invalid}), backend))
+                missing = dict(required)
+                del missing[key]
+                self.assertFalse(gateway.failure_evidence_passed(missing, backend))
+
+    def test_negative_test_not_started_after_failed_positive_validation(self):
+        self.calls['validation'].return_value = {'passed': False}
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.calls['failure_test'].assert_not_called()
+        self.assert_aborted('selection')
+
+    def test_initial_timeout_record_excludes_argv_and_output(self):
+        secret = 'DO-NOT-LOG-SYNTHETIC-PRIVATE-DATA'
+        self.calls['preflight'].side_effect = subprocess.TimeoutExpired(
+            ['private-tool', secret], 35, output=secret, stderr=secret)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('initial_preflight')
+        self.assertEqual(report['failure']['kind'], 'timeout')
+        self.assertNotIn(secret, json.dumps(self.saved))
+        self.calls['prompt_credentials'].assert_not_called()
+        self.calls['start_transport'].assert_not_called()
+
+    def test_next_preflight_failure_keeps_previous_result_and_failed_stage(self):
+        self.calls['preflight'].side_effect = [{}, gateway.GatewayError('SYNTHETIC-PRIVATE-ENDPOINT')]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('transport_preflight')
+        self.assertEqual(report['transport'], 'tcp')
+        self.assertTrue(self.saved['transports.json']['udp']['usable'])
+        self.assertFalse(self.saved['transports.json']['tcp']['usable'])
+        self.assertNotIn('SYNTHETIC-PRIVATE-ENDPOINT', json.dumps(self.saved))
+        self.calls['start_transport'].assert_called_once_with('udp', backend='wsl')
+
+    def test_final_preflight_failure_prevents_repeat_connection(self):
+        self.calls['preflight'].side_effect = [{}, {}, gateway.GatewayError('outer mismatch')]
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.assert_aborted('final_preflight')
+        self.assertEqual(self.calls['start_transport'].call_count, 2)
+
+    def test_cancelled_credentials_are_cleaned_up_and_recorded(self):
+        self.calls['prompt_credentials'].side_effect = KeyboardInterrupt('SYNTHETIC-PRIVATE-INPUT')
+        with self.assertRaises(KeyboardInterrupt):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('credentials')
+        self.assertEqual(report['failure']['kind'], 'cancelled')
+        self.assertNotIn('SYNTHETIC-PRIVATE-INPUT', json.dumps(self.saved))
+        self.calls['start_transport'].assert_not_called()
+
+    def test_cleanup_failure_keeps_original_failure_evidence(self):
+        self.calls['preflight'].side_effect = gateway.GatewayError('SYNTHETIC-PRIVATE-ERROR')
+        self.calls['stop_internal'].side_effect = [None, OSError('SYNTHETIC-PRIVATE-PATH')]
+        with self.assertRaises(OSError):
+            gateway.compare_transports('wsl')
+        report = self.assert_aborted('initial_preflight')
+        self.assertEqual(report['failure']['kind'], 'gateway_check_failed')
+        self.assertEqual(report['cleanup_failure'], {'phase': 'cleanup', 'kind': 'os_error'})
+        self.assertNotIn('SYNTHETIC-PRIVATE', json.dumps(self.saved))
+
+    def test_new_preflight_cannot_hide_host_change_across_comparison(self):
+        self.calls['compare_host'].return_value = {'host_dns_preserved': False}
+        with self.assertRaises(gateway.GatewayError):
+            gateway.compare_transports('wsl')
+        self.assert_aborted('host_preservation')
+
+    def test_success_requires_complete_evidence_and_keeps_saved_backend(self):
+        gateway.compare_transports('wsl')
+        report = self.saved['comparison.json']
+        self.assertTrue(report['completed'])
+        self.assertTrue(report['session_ready'])
+        self.assertFalse(report['cleanup_attempted'])
+        self.assertEqual(report['phase'], 'complete')
+        self.calls['save_preferences'].assert_called_once_with({'backend': 'docker', 'default_transport': 'udp'})
+        self.assertEqual(self.calls['preflight'].call_count, 3)
+        self.assertEqual(self.calls['validation'].call_count, 3)
+        self.calls['stop_internal'].assert_called_with(keep_auth=True, backend='wsl')
+
+    def test_docker_comparison_remains_wsl_independent_on_macos(self):
+        self.calls['backend_name'].return_value = 'docker'
+        self.calls['failure_test'].return_value = {key: value for key, value in self.evidence.items()
+                                                   if key != 'state_restored'}
+        with patch.object(gateway.host, 'IS_WINDOWS', False):
+            gateway.compare_transports('docker')
+        self.assertTrue(self.saved['comparison.json']['completed'])
+        self.calls['wsl_status_data'].assert_not_called()
+        self.calls['stop_internal'].assert_called_with(keep_auth=True, backend='docker')
+
+
 if __name__ == '__main__': unittest.main()

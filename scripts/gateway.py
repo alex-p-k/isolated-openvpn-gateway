@@ -1086,50 +1086,109 @@ def restore_wsl_after_failure_test(canary):
         time.sleep(2)
     return False
 
+def failure_evidence_passed(evidence, backend):
+    required = ('openvpn_terminated', 'tun0_absent', 'proxy_request_verified_before_stop',
+                'socks_after_vpn_stop_blocked', 'firewall_forced_outer_blocked', 'host_still_online')
+    if backend == 'wsl':
+        required += ('state_restored',)
+    return isinstance(evidence, dict) and all(evidence.get(key) is True for key in required)
+
+
+def comparison_error(exc, phase):
+    # Exception text, subprocess argv/stdout/stderr and paths can contain private
+    # deployment data. Persist only an allowlisted category and our own stage.
+    kind = ('cancelled' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else
+            'timeout' if isinstance(exc, subprocess.TimeoutExpired) else
+            'gateway_check_failed' if isinstance(exc, GatewayError) else
+            'os_error' if isinstance(exc, OSError) else 'unexpected_error')
+    return {'phase': phase, 'kind': kind}
+
+
 def compare_transports(backend='docker'):
     selected_backend = backend_name(backend)
-    stop_internal(backend=selected_backend)
-    before=preflight(selected_backend)
+    results = {}
+    report = {'backend': selected_backend, 'phase': 'initial_stop', 'transport': None,
+              'completed': False, 'session_ready': False, 'cleanup_attempted': False}
+    completed = False
+
+    def save():
+        private_write(ROOT/'validation'/'transports.json', json.dumps(results, indent=2))
+        private_write(ROOT/'validation'/'comparison.json', json.dumps(report, indent=2))
+
+    def checkpoint(phase, transport=None):
+        report.update(phase=phase, transport=transport)
+        save()
+
     try:
-        prompt_credentials(selected_backend)
-    except BaseException:
+        checkpoint('initial_stop')
         stop_internal(backend=selected_backend)
-        raise
-    results={}
-    selected=None
-    try:
+        checkpoint('initial_preflight')
+        before = preflight(selected_backend)
+        checkpoint('credentials')
+        prompt_credentials(selected_backend)
         transports = list(configuration()['transports'])
         for index, transport in enumerate(transports):
+            row = {'connected': False, 'usable': False}
+            results[transport] = row
             if index:
-                # stop_internal removed the previous backend network. Verify
-                # the new outer path before reusing credentials on a new VPN.
+                # A torn-down backend needs a fresh verified outer path before
+                # any retained credentials can be reused on the next VPN.
+                checkpoint('transport_preflight', transport)
                 preflight(selected_backend)
-            ok=start_transport(transport, backend=selected_backend)
-            current_state=wsl_status_data() if selected_backend == 'wsl' else read_json(STATE/'status.json')
-            row={'connected':ok, 'openvpn_initialized':bool(current_state.get('initialization_completed')),
-                 'gateway_state':current_state}
-            if ok:
-                row['validation']=validation(preferences().get('test_url'), selected_backend)
-                row['failure_test']=failure_test(selected_backend)
-            row['usable'] = ok and row.get('validation',{}).get('passed',False) and all(row.get('failure_test',{}).values())
-            row['events']=(STATE/'safe.log').read_text() if (STATE/'safe.log').exists() else ''
-            results[transport]=row
-            private_write(ROOT/'validation'/'transports.json',json.dumps(results,indent=2))
+            checkpoint('transport_start', transport)
+            row['connected'] = start_transport(transport, backend=selected_backend)
+            current_state = wsl_status_data() if selected_backend == 'wsl' else read_json(STATE/'status.json')
+            row.update(openvpn_initialized=bool(current_state.get('initialization_completed')),
+                       gateway_state=current_state)
+            if row['connected'] is True:
+                checkpoint('transport_validation', transport)
+                row['validation'] = validation(preferences().get('test_url'), selected_backend)
+                if row['validation'].get('passed') is True:
+                    checkpoint('transport_negative_test', transport)
+                    row['failure_test'] = failure_test(selected_backend)
+                    row['usable'] = failure_evidence_passed(row['failure_test'], selected_backend)
+            row['events'] = (STATE/'safe.log').read_text() if (STATE/'safe.log').exists() else ''
+            checkpoint('transport_stop', transport)
             stop_internal(keep_auth=True, backend=selected_backend)
-        selected=next((x for x in transports if results[x]['usable']),None)
-        if selected:
-            preflight(selected_backend)
-            if not start_transport(selected, backend=selected_backend):
-                selected=None
-                raise GatewayError('Chosen transport failed its repeat connection test.')
-            prefs=preferences(); prefs['default_transport']=selected; save_preferences(prefs)
-            validation(prefs.get('test_url'), selected_backend)
-            print('Selected default: '+selected+'; the other profile remains available.',flush=True)
-        else:
-            raise GatewayError('Neither transport passed all gateway checks; sanitized transport evidence saved.')
+        checkpoint('selection')
+        selected = next((name for name in transports if results[name]['usable']), None)
+        if not selected:
+            raise GatewayError('No transport passed all gateway checks; private comparison evidence saved.')
+        checkpoint('final_preflight', selected)
+        preflight(selected_backend)
+        checkpoint('final_start', selected)
+        if not start_transport(selected, backend=selected_backend):
+            raise GatewayError('Chosen transport failed its repeat connection test.')
+        checkpoint('final_validation', selected)
+        prefs = dict(preferences())
+        report['final_validation'] = validation(prefs.get('test_url'), selected_backend)
+        if report['final_validation'].get('passed') is not True or not ready(selected_backend):
+            raise GatewayError('Chosen transport failed final validation; selection was not saved.')
+        checkpoint('host_preservation', selected)
+        report['host_preservation'] = compare_host(before, network_snapshot())
+        if not report['host_preservation'] or not all(value is True for value in report['host_preservation'].values()):
+            raise GatewayError('Host state changed during comparison; selection was not saved.')
+        checkpoint('save_selection', selected)
+        prefs['default_transport'] = selected
+        save_preferences(prefs)
+        report.update(completed=True, session_ready=True)
+        checkpoint('complete', selected)
+        completed = True
+        print('Selected default: '+selected+'; other configured profiles remain available.', flush=True)
+    except BaseException as exc:
+        report.update(completed=False, session_ready=False,
+                      failure=comparison_error(exc, report['phase']))
+        raise
     finally:
-        if not selected or not ready(selected_backend):
-            stop_internal(backend=selected_backend)
+        if not completed:
+            report['cleanup_attempted'] = True
+            try:
+                stop_internal(backend=selected_backend)
+            except BaseException as exc:
+                report['cleanup_failure'] = comparison_error(exc, 'cleanup')
+                raise
+            finally:
+                save()
 
 def repository_ssh_config(host, user_config='~/.ssh/config', system_config='/etc/ssh/ssh_config',
                           proxy_host=None, proxy_port=None, proxy_command=None):
