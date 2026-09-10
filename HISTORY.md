@@ -109,102 +109,105 @@ The bounded file operations follow Microsoft's documented [reparse-point open se
 
 ## Archived handoff notes
 
-### Безопасная передача другому человеку
+The notes below are an English translation of the original historical handoff.
+They describe the older revisions, not the current setup wizard.
 
-#### Как объяснить в одном абзаце
+### Safe handoff to another person
 
-Это локальный изолированный OpenVPN-to-SOCKS5 gateway для macOS и Windows. На Windows корпоративный OpenVPN работает либо в Docker Desktop Linux containers, либо в отдельном управляемом WSL2-дистрибутиве `IsolatedOpenVPNGateway` без Docker. WSL-процессы дополнительно находятся во вложенном network namespace, поэтому firewall не затрагивает общий WSL namespace и другие дистрибутивы. Только выбранные приложения подключаются через `socks5h://127.0.0.1:1080`; обычные Windows routes/DNS и внешний VPN не меняются.
+#### Explain it in one paragraph
 
-#### Что передавать
+This is a local, isolated OpenVPN-to-SOCKS5 gateway for macOS and Windows. On Windows, corporate OpenVPN runs either in Docker Desktop Linux containers or in a dedicated managed WSL2 distro named `IsolatedOpenVPNGateway`, without Docker. The WSL processes also run in a nested network namespace, so the firewall does not affect WSL's shared namespace or other distros. Only selected applications connect through `socks5h://127.0.0.1:1080`; ordinary Windows routes, DNS, and the external VPN remain unchanged.
 
-Передавайте раздельно и по одобренным каналам:
+#### What to share
 
-- release ZIP и внешний `.sha256`;
-- приватный `gateway.toml`;
-- актуальные `.ovpn` напрямую от IT;
-- `QUICKSTART.md`, `WINDOWS.md` и `ROLLBACK.md`.
+Share these separately through approved channels:
 
-Не передавайте:
+- the release ZIP and its external `.sha256` file;
+- the private `gateway.toml`;
+- current `.ovpn` profiles directly from IT;
+- `QUICKSTART.md`, `WINDOWS.md`, and `ROLLBACK.md`.
 
-- `runtime/`, `validation/`, `backups/`, `settings.json` или `installation.json`;
-- auth-файлы, browser profile/cookies или WSL VHDX;
-- Git-репозитории как часть gateway kit;
-- логин, пароль, private keys, сертификаты или содержимое `.ovpn` в чат/issue;
-- endpoint/DNS/adapter diagnostics без отдельного согласования.
+Do not share:
 
-Release строится по явному allowlist и не включает `gateway.toml`, `config/`, `runtime/`, `.ovpn`, ключи или диагностику.
+- `runtime/`, `validation/`, `backups/`, `settings.json`, or `installation.json`;
+- auth files, browser profiles/cookies, or the WSL VHDX;
+- Git repositories as part of the gateway kit;
+- usernames, passwords, private keys, certificates, or `.ovpn` contents in chat or issues;
+- endpoint, DNS, or adapter diagnostics without separate approval.
 
-#### Что выбрать на Windows Home
+The release uses an explicit allowlist and excludes `gateway.toml`, `config/`, `runtime/`, `.ovpn` files, keys, and diagnostics.
 
-| Backend | Когда использовать | Docker Desktop |
+#### Which backend to choose on Windows Home
+
+| Backend | When to use it | Docker Desktop |
 |---|---|---:|
-| `docker` | Docker Desktop уже одобрен и работает с Linux containers/WSL2 | нужен |
-| `wsl` | нужен отдельный Docker-free Linux gateway | не нужен |
+| `docker` | Docker Desktop is already approved and works with Linux containers/WSL2 | required |
+| `wsl` | You need a separate Docker-free Linux gateway | not required |
 
-Оба backend используют WSL2-compatible lightweight virtualization и не требуют Hyper-V Manager. Не устанавливайте OpenVPN в основной пользовательский Ubuntu/WSL. Полная Hyper-V VM — отдельный Pro-only manual fallback и не поддерживается CLI.
+Both backends use WSL2-compatible lightweight virtualization and do not require Hyper-V Manager. Do not install OpenVPN in the user's main Ubuntu/WSL distro. A full Hyper-V VM is a separate, Pro-only manual fallback and is not supported by the CLI.
 
-#### Приёмка на новом компьютере
+#### Acceptance on a new machine
 
-1. Проверить внешний checksum release ZIP.
-2. Убедиться, что Windows edition/build/architecture и hardware virtualization подходят.
-3. Установить Python 3.11+, Git и выбранный backend prerequisite: Docker Desktop Linux containers или WSL2.
-4. Включить внешний VPN, определить его adapter и заполнить `windows_outer_adapter_contains`.
-5. Выполнить `install.py --check --backend docker|wsl ...`, затем установку с тем же backend.
-6. Для WSL выполнить `vpn-gateway install --backend wsl`; убедиться, что создан только `IsolatedOpenVPNGateway`.
-7. Запустить `vpn-gateway start --backend ...` и ввести собственные credentials.
-8. Выполнить `vpn-gateway test https://REAL-PRIVATE-HOST/`.
-9. Выполнить `vpn-gateway compare-transports --backend ...`: это обязательный positive/negative fail-closed test.
-10. Проверить отдельный browser и read-only `git ls-remote` нужного репозитория.
-11. Остановить gateway и подтвердить, что private browser/Git перестали работать, а обычная сеть сохранила внешний VPN egress.
-12. На Windows выполнить `tools\windows_acceptance.ps1` и сохранить только безопасный итоговый отчёт, не raw DNS/routes.
+1. Verify the release ZIP's external checksum.
+2. Check Windows edition, build, architecture, and hardware virtualization.
+3. Install Python 3.11+, Git, and the selected backend prerequisite: Docker Desktop with Linux containers, or WSL2.
+4. Connect the external VPN, identify its adapter, and fill in `windows_outer_adapter_contains`.
+5. Run `install.py --check --backend docker|wsl ...`, then install using the same backend.
+6. For WSL, run `vpn-gateway install --backend wsl` and verify that only `IsolatedOpenVPNGateway` was created.
+7. Run `vpn-gateway start --backend ...` and enter your own credentials.
+8. Run `vpn-gateway test https://REAL-PRIVATE-HOST/`.
+9. Run `vpn-gateway compare-transports --backend ...`: this is the required positive/negative fail-closed test.
+10. Check the separate browser and a read-only `git ls-remote` for the intended repository.
+11. Stop the gateway and confirm that private browser/Git access fails while ordinary traffic retains the external VPN's egress.
+12. On Windows, run `tools\windows_acceptance.ps1` and save only a safe summary, not raw DNS/route data.
 
-Не переносите состояние сессии. На новый компьютер устанавливаются только публичный движок и приватные deployment inputs; credentials вводит новый пользователь. Репозитории остаются обычными NTFS-папками и переносятся независимо.
+Do not transfer session state. Install only the public gateway code and private deployment inputs on the new machine; the new user enters their own credentials. Repositories remain ordinary NTFS directories and are transferred independently.
 
-Для Debian 13 установщик собирает Dante 1.4.4 из официального исходника с проверкой закреплённого SHA-256 (в Debian 13 нет пакета `dante-server`). Нужен доступ к Debian и `www.inet.no`; смешивание stable/testing репозиториев не выполняется. Corporate DNS живёт только в bind-mounted resolver сетевого namespace шлюза, а внешний WSL resolver сохраняет DNS tunneling.
+For Debian 13, the installer builds Dante 1.4.4 from official source after verifying a pinned SHA-256, because Debian 13 has no `dante-server` package. Access to Debian and `www.inet.no` is required; stable/testing repositories are not mixed. Corporate DNS lives only in the gateway network namespace's bind-mounted resolver, while the outer WSL resolver retains DNS tunneling.
 
-#### Что не автоматизируется
+#### What is not automated
 
-- изменение `%USERPROFILE%\.wslconfig`, NAT/mirrored mode, Windows Firewall, routes или DNS;
-- отключение требований outer VPN;
-- угадывание корпоративных hostnames/DNS;
-- настройка глобального Git/SSH proxy;
-- перенос browser profile/cookies;
-- Git push ради проверки.
+- Changes to `%USERPROFILE%\.wslconfig`, NAT/mirrored mode, Windows Firewall, routes, or DNS;
+- disabling the external-VPN requirement;
+- guessing corporate hostnames or DNS addresses;
+- configuring global Git/SSH proxies;
+- transferring browser profiles or cookies;
+- Git pushes for testing.
 
-Если внешний VPN не наследуется WSL/Docker, это blocker. Возможный mirrored mode обсуждается отдельно, с backup, явным согласием, `wsl --shutdown`, повторным preflight и rollback из `ROLLBACK.md`.
+If WSL or Docker does not inherit the external VPN's path, that is a blocker. Mirrored mode must be considered separately, with a backup, explicit approval, `wsl --shutdown`, repeated preflight checks, and rollback as described in `ROLLBACK.md`.
 
-#### Границы подтверждённой проверки
+#### Boundaries of verified acceptance
 
-На Windows 11 Home Single Language 25H2 (build 26200.9168, AMD64) 2026-09-07 подтверждены реальное корпоративное подключение WSL2, ответ pushed DNS через Windows SOCKS, positive/negative fail-closed с независимым внешним control case и восстановление сеанса. Windows routes/DNS/egress и глобальный Git proxy сохранились. Это не заменяет проверку конкретного private URL и Git-репозитория новым пользователем: доступ к приложению, его авторизация и отдельный browser проверяются отдельно. Полные диагностические JSON остаются приватными и не входят в release; актуальные ограничения перечислены в `WINDOWS.md`.
+On Windows 11 Home Single Language 25H2 (build 26200.9168, AMD64), real WSL2 corporate connectivity, pushed-DNS responses through Windows SOCKS, positive/negative fail-closed tests with an independent outer control, and session restoration were verified on 2026-09-07. Windows routes, DNS, egress, and the global Git proxy were preserved. This does not replace a new user's checks of their private URL and Git repository: application access, authentication, and the separate browser must be tested separately. Full diagnostic JSON remains private and is excluded from the release; limitations are documented in the Windows notes.
 
-Владелец тестовой машины подтвердил открытие корпоративного task tracker в отдельном Chrome и позднее подтвердил, что при выключенном gateway страница не открывается. Это ручная положительная/отрицательная проверка, не автоматическая UI-проверка. После интерактивной HTTPS-авторизации полное клонирование на NTFS завершилось: HEAD доступен, tracked worktree чистый. Повторный read-only запрос прошёл через repository-local SOCKS без process-level proxy override; push не выполнялся. Эти результаты не переносят авторизацию на другого пользователя и не заменяют его собственную приёмку. Не прерывайте активные Git-передачи ради обновления forwarder или negative test. Исправление всплывающих WSL-консолей установлено после завершения клонирования.
+The test-machine owner confirmed that the corporate task tracker opened in the separate Chrome profile, and later confirmed that it did not open with the gateway off. This is manual positive/negative evidence, not automated UI verification. After interactive HTTPS authentication, the full clone onto NTFS completed: HEAD was available and the tracked worktree was clean. A repeated read-only query passed through repository-local SOCKS without a process-level proxy override; no push was performed. These results do not transfer authentication to another user or replace their acceptance checks. Do not interrupt active Git transfers to update the forwarder or run a negative test. The fix for flashing WSL console windows was installed after the clone completed.
 
-Ранние Python-проверки сохранности Windows DNS/routes охватывали IPv4. Теперь CLI требует и успешное сравнение IPv6 DNS/routes; старый baseline без IPv6 не считается достаточным. После завершения клонирования реальная парная проверка IPv4/IPv6 DNS/routes прошла при остановке и повторном запуске VPN, включая новый outer preflight и успешный private HTTPS-запрос. Старый baseline сохранён отдельно, новый сформирован контролируемым preflight. Позднейшие попытки public IPv6 egress не дали результата: основной probe получил DNS error/timeout, а независимый numeric HTTPS control также не сработал по IPv4. Это не доказательство отсутствия IPv6 и не подтверждение равенства IPv6 egress.
+Early Python checks of Windows DNS/route preservation covered IPv4. The CLI subsequently required successful IPv6 DNS/route comparisons too; an older baseline without IPv6 is insufficient. After the clone completed, real paired IPv4/IPv6 DNS/route checks passed across VPN stop and restart, including fresh outer preflight and a successful private HTTPS request. The old baseline was retained separately; a new baseline was created by controlled preflight. Later public IPv6 egress attempts were inconclusive: the primary probe encountered DNS errors/timeouts, and an independent numeric HTTPS control also failed over IPv4. This neither proves that IPv6 is absent nor establishes IPv6 egress equality.
 
-Последующая повторная проверка UDP1194 прошла positive/negative fail-closed, но сравнение остальных transport не завершилось и исходный сеанс не восстановился. Итоговое состояние проверено отдельно: OpenVPN остановлен, credentials удалены, SOCKS listener отсутствует. Позднейшая диагностика без credentials снова показала совпадение Windows/WSL egress и сохранность host IPv4/IPv6 DNS/routes; нестабильность переподключения остаётся ограничением. Для восстановления нужен новый интерактивный `start`, а не auth-файл из backup. После нового интерактивного запуска и отдельного согласия установленный PowerShell listener acceptance прошёл с process-only `RemoteSigned`; сохранён исходный policy snapshot, постоянные scopes после проверки не изменились. Это не разрешение менять системную policy на компьютере следующего владельца.
+A subsequent UDP1194 recheck passed positive/negative fail-closed testing, but comparison of the other transports did not finish and the original session was not restored. The final state was checked separately: OpenVPN was stopped, credentials were removed, and no SOCKS listener remained. Later credential-free diagnostics again showed equal Windows/WSL egress and preserved host IPv4/IPv6 DNS/routes; intermittent reconnection remained a limitation. Recovery requires a new interactive `start`, not an auth file from backup. After another interactive start and separate approval, the installed PowerShell listener acceptance passed with process-only `RemoteSigned`. The original policy snapshot was preserved, and persistent scopes remained unchanged after testing. This is not permission to change policy on the next owner's machine.
 
-Актуальный завершённый повтор после исправления namespace-start race: полный `compare-transports` на установленной WSL-копии прошёл для обоих UDP-ключей, восстановил UDP1194 и подтвердил сохранность Windows IPv4/IPv6 DNS/routes, public IPv4 egress и глобальных Git-настроек относительно исходного baseline. Дополнительный private HTTPS-запрос вернул 302 с проверкой TLS. TCP443 был реально запущен, но не инициализировался: соединение с HTTP-proxy из этого профиля истекло по timeout как в root WSL, так и внутри namespace, при успешном независимом внешнем HTTPS-контроле. Это не успешная TCP-приёмка; требуется проверка доступности control endpoint по текущему внешнему пути. Приватные адреса и исходные логи остаются вне публичного отчёта и Git.
+After the namespace-start race was fixed, a complete `compare-transports` run on the installed WSL copy passed for both UDP keys, restored UDP1194, and confirmed preservation of Windows IPv4/IPv6 DNS/routes, public IPv4 egress, and global Git settings against the original baseline. An additional private HTTPS request returned 302 with TLS verification. TCP443 was actually started but did not initialize: the profile's HTTP-proxy connection timed out both in root WSL and inside the namespace, while the independent outer HTTPS control succeeded. This was not successful TCP acceptance; control-endpoint reachability over the current outer path still needs investigation. Private addresses and original logs remain outside the public report and Git.
 
-Последующий запуск Docker Desktop завершился ошибкой его Ingest service до появления Linux engine: Windows 1920 при доступе к устаревшему AF_UNIX socket. Разрешённое переименование этого socket не удалось из агентской сессии, но позднее было выполнено владельцем в обычном PowerShell. Backup сохранён и проверен. Повторный запуск Docker остановился на другом служебном объекте `dockerInference`; его не меняли. Сброс Docker, удаление данных, изменение ACL или перезагрузка WSL не выполнялись. Работающий UDP-шлюз WSL и Windows IPv4/IPv6 DNS/routes, внешний public IPv4 egress и глобальные Git-настройки сохранены. Владелец явно отложил Docker-приёмку и выбрал WSL-only; сохранённый backend уже был `wsl`. Docker не удалён и не объявлен проверенным. Подробности и границы возможного rollback socket — в `WINDOWS.md`; сырые Docker logs не передавать автоматически.
+A later Docker Desktop launch failed in its Ingest service before the Linux engine started: Windows error 1920 occurred while accessing a stale AF_UNIX socket. The approved socket rename failed from the agent session but was later performed by the owner in an ordinary PowerShell window. The backup was preserved and verified. The next Docker launch stopped at another service object, `dockerInference`, which was not changed. No Docker reset, data deletion, ACL modification, or WSL restart was performed. The working UDP WSL gateway, Windows IPv4/IPv6 DNS/routes, external public IPv4 egress, and global Git settings were preserved. The owner explicitly deferred Docker acceptance and selected WSL only; the saved backend was already `wsl`. Docker was neither removed nor declared verified. See the archived Windows notes above for details and socket rollback boundaries; do not automatically share raw Docker logs.
 
-Исправлен отдельный дефект отчёта: WSL comparison раньше читал Windows-путь журнала Docker. Теперь `events` берётся из выбранного backend; хвост ограничен 200 строками, `event_log.available` показывает доступность. У WSL `scope=backend_history`: это история нескольких запусков, а не доказательство событий только текущего транспорта. Проверка reader на реальном существующем журнале прошла без перезапуска VPN и чтения credentials. Прежние результаты comparison не переписывались; новый reader не означает успешное TCP-подключение. В отчёте не публиковать текст событий, даже если журнал называется `safe.log`.
+A separate reporting defect was fixed: WSL comparison previously read a Windows path for the Docker log. It now obtains `events` from the selected backend; the tail is limited to 200 lines, and `event_log.available` indicates availability. WSL uses `scope=backend_history`: it contains multiple starts, not evidence specific to the current transport. The reader was checked against a real existing log without restarting the VPN or reading credentials. Previous comparison results were not rewritten; the new reader does not establish a successful TCP connection. Do not publish event text, even if the log is named `safe.log`.
 
-Если обычная PowerShell-консоль не находит `vpn-gateway`, повторите две session-only строки PATH, которые вывел установщик, или используйте `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status`. Нужен именно фактический путь `Installed:`, в том числе при перенаправленной packaged/MSIX-установке; отсутствие команды в PATH не означает, что VPN остановлен. Постоянный User/Machine PATH и PowerShell profile установщик не меняет.
+If an ordinary PowerShell window cannot find `vpn-gateway`, repeat the two session-only PATH lines printed by the installer or use `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status`. Use the actual `Installed:` path, including redirected packaged/MSIX installations. A missing PATH command does not mean the VPN stopped. The historical installer did not change persistent User/Machine PATH or PowerShell profiles.
 
-#### Снятие доступа
+#### Access revocation
 
-При cleanup Linux PID сверяется с ожидаемой командой, root UID и network namespace; сигналы отправляются через pidfd, чтобы повторное использование номера PID не перенаправило остановку на другой процесс. Девять дополнительных тестов прошли внутри WSL, включая реальные временные процессы с положительным и отрицательным контролем. Работающий VPN для этого не останавливался. Этот тест сам по себе не заменяет uninstall-приёмку. При ошибке безопасной остановки не применяйте массовый kill; auth обычного `stop` удаляется и при такой ошибке.
+During cleanup, each Linux PID is checked against its expected command, root UID, and network namespace. Signals use pidfd so PID reuse cannot redirect termination to another process. Nine additional tests passed inside WSL, including real temporary processes with positive and negative controls. The working VPN was not stopped for those tests. This alone does not replace uninstall acceptance. Do not use mass-kill commands after a safe-stop error; normal `stop` still removes auth material on such an error.
 
 ```text
 vpn-gateway stop
-vpn-gateway uninstall --backend wsl   # только project-owned WSL distro
-vpn-gateway uninstall                 # полный project-owned cleanup
+vpn-gateway uninstall --backend wsl   # project-owned WSL distro only
+vpn-gateway uninstall                 # full project-owned cleanup
 ```
 
-Uninstall не удаляет WSL как Windows-компонент, Docker Desktop, другие WSL-дистрибутивы, внешний VPN, репозитории или глобальные настройки host. Если ownership marker отсутствует или изменён, удаление останавливается для ручной проверки.
+Uninstall does not remove WSL as a Windows component, Docker Desktop, other WSL distros, the external VPN, repositories, or global host settings. If an ownership marker is missing or changed, deletion stops for manual review.
 
-После отдельного согласия владельца реальная полная WSL-only uninstall-приёмка прошла: удалены credentials, tun0, namespace, listener, управляемый дистрибутив, установленные файлы и четыре записанных Git-ключа. Сохранены исходные IT-профили, файлы/HEAD репозитория на NTFS, остальные Git-настройки, другие WSL-дистрибутивы, Windows IPv4/IPv6 routes/DNS, внешний IPv4 egress и `.wslconfig`. Browser profile оставлен по выбору владельца; Docker не вызывался. Выявленная ошибка CMD после удаления собственного launcher исправлена; повторный uninstall только Windows-слоя завершился с кодом 0. Для восстановления используются исходные IT-профили, не копия auth или VHDX. Новое подключение и его приёмка требуют свежего интерактивного ввода credentials: результаты прежней сессии не переносятся на новую автоматически.
+After separate owner approval, real full WSL-only uninstall acceptance passed: credentials, tun0, the namespace, listener, managed distro, installed files, and four recorded Git keys were removed. Original IT profiles, NTFS repository files/HEAD, other Git settings, other WSL distros, Windows IPv4/IPv6 routes/DNS, external IPv4 egress, and `.wslconfig` were preserved. The owner chose to retain the browser profile; Docker was not invoked. The CMD error after deleting its own launcher was fixed, and a repeated Windows-layer-only uninstall exited with code 0. Recovery uses original IT profiles, not copied auth or a VHDX. A new connection and its acceptance require fresh interactive credentials; prior-session results do not automatically apply to it.
 
-Повторная установка завершена на прежнем physical root с сохранённым выбором WSL и восстановленными локальными Git-ключами. Новый preflight без credentials подтвердил равенство Windows/root WSL/namespace public IPv4, ожидаемый внешний маршрут и systemd. Диагностический namespace был удалён; до интерактивного запуска OpenVPN, credentials и listener отсутствовали, Windows IPv4/IPv6 routes/DNS и внешний IPv4 egress сохранились.
+Reinstallation completed at the previous physical root with WSL still selected and local Git keys restored. Fresh credential-free preflight confirmed equal Windows/root-WSL/namespace public IPv4, the expected outer route, and systemd. The diagnostic namespace was removed. Before interactive startup, OpenVPN, credentials, and the listener were absent, while Windows IPv4/IPv6 routes/DNS and external IPv4 egress were preserved.
 
-Владелец затем ввёл credentials локально. Новая UDP-сессия прошла pushed DNS, корпоративный HTTPS 302 с проверкой TLS и read-only Git через восстановленный repository-local proxy. Повторный парный fail-closed тест подтвердил положительный SOCKS payload до остановки OpenVPN, отсутствие tun0/доступа SOCKS после неё, успешный независимый внешний контроль и firewall REJECT для принудительного выхода proxy UID наружу. После нового outer preflight исходный transport восстановлен, HTTPS/DNS и сохранность host IPv4/IPv6 routes/DNS, public IPv4 и глобального Git подтверждены повторно. Сеанс оставлен рабочим. Владелец заново подтвердил открытие tracker в отдельном Chrome после Ctrl+Shift+R; это ручной положительный результат, отрицательная browser-проверка относится к прежней установке. Все профили и удалённое LAN-устройство в этом повторе не проверялись; ограничения TCP/IPv6 сохраняются.
+The owner then entered credentials locally. The new UDP session passed pushed-DNS, corporate HTTPS 302 with TLS verification, and read-only Git checks through the restored repository-local proxy. A repeated paired fail-closed test confirmed a successful SOCKS payload before stopping OpenVPN, no tun0 or SOCKS access afterwards, a successful independent outer control, and firewall REJECT enforcement for a forced outbound attempt by the proxy UID. After fresh outer preflight, the original transport was restored; HTTPS, DNS, host IPv4/IPv6 routes/DNS, public IPv4, and global Git preservation were checked again. The session was left working. The owner again confirmed that the tracker opened in the separate Chrome profile after Ctrl+Shift+R. This is a manual positive result; the negative browser test belongs to the previous installation. Not all profiles or a remote LAN device were tested in this repeat; TCP and IPv6 limitations remain.

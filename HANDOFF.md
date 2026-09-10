@@ -1,59 +1,68 @@
-# Безопасная передача другому разработчику
+# Safe handoff to another developer
 
-## Что это
+## What the project does
 
-Корпоративный OpenVPN работает в Docker Linux containers или отдельном WSL2-дистрибутиве.
-Только явно настроенные приложения идут через локальный SOCKS5; обычные routes/DNS
-Windows и внешний VPN не меняются. На Windows Home доступен Docker-free WSL-вариант.
+Corporate OpenVPN runs in Docker Linux containers or a dedicated WSL2 distro.
+Only explicitly configured applications use the local SOCKS5 proxy; ordinary
+Windows routes, DNS, and the external VPN remain unchanged. Windows Home supports
+the Docker-free WSL backend.
 
-## Что передать
+## What to share
 
-- Ссылку на проверенный commit этого репозитория либо allowlisted release ZIP с checksum.
-- [QUICKSTART.md](QUICKSTART.md), [WINDOWS.md](WINDOWS.md), [ROLLBACK.md](ROLLBACK.md).
-- Через отдельный одобренный IT-канал: совместимый `.ovpn` или `gateway.toml` + профили.
-- Сведения о требуемом внешнем VPN и корпоративном URL, без credentials.
+- A link to a reviewed repository commit, or an allowlisted release ZIP with its checksum.
+- [QUICKSTART.md](QUICKSTART.md), [WINDOWS.md](WINDOWS.md), and [ROLLBACK.md](ROLLBACK.md).
+- Through a separate IT-approved channel: a compatible `.ovpn`, or `gateway.toml` and its profiles.
+- The required external VPN and corporate start URL, without credentials.
 
-Мастер `.\setup.cmd` рассчитан на нового разработчика: импорт, выбор backend/адаптера,
-подготовка Linux, необязательный User PATH, browser и локальный Git.
-Git требуется для работы с репозиториями, но не для browser-only шлюза.
-Новый пользователь вводит свои credentials локально; состояние вашей сессии не переносится.
+The `.\setup.cmd` wizard guides a new developer through importing inputs, selecting
+a backend and adapter, provisioning Linux, and optionally configuring User PATH,
+a browser, and repository-local Git. Git is needed for repository operations, not
+for browser-only gateway use. The new user enters their own credentials locally;
+your session state is not transferred.
 
-## Что не передавать
+## What not to share
 
-- `config/`, `runtime/`, `validation/`, `backups/`, WSL VHDX;
-- `settings.json`, ownership/setup/update/PATH journals и registry exports;
-- browser profiles, cookies, auth-файлы или Git credential-helper хранилища;
-- corporate endpoints, сертификаты, private keys и сырые network traces в публичный issue.
+- `config/`, `runtime/`, `validation/`, `backups/`, or the WSL VHDX;
+- `settings.json`, ownership/setup/update/PATH journals, or registry exports;
+- browser profiles, cookies, auth files, or Git credential-helper stores;
+- corporate endpoints, certificates, private keys, or raw network traces in a public issue.
 
-Сборка release использует явный allowlist: она не обходит весь checkout и не захватывает
-приватные файлы рядом с исходниками. Наличие checksum не заменяет проверку источника.
+The release builder uses an explicit allowlist. It does not walk the entire
+checkout or collect private files alongside the source. A checksum verifies
+integrity; it does not replace verification of the source's trustworthiness.
 
-## Что проверить на новом компьютере
+## What to verify on the new machine
 
-Пройдите [UX_ACCEPTANCE.md](UX_ACCEPTANCE.md): новый Windows Home-пользователь,
-новый терминал с рабочей командой, оба input flow, прерывание/повтор, браузер и
-read-only Git, update/rollback, uninstall ownership boundaries.
-Сетевая приёмка требует положительного запроса, отрицательного теста при потере tun0,
-работающего независимого control case и восстановления. Не делайте push ради теста.
+Follow [UX_ACCEPTANCE.md](UX_ACCEPTANCE.md): a new Windows Home user, command
+discovery in a fresh terminal, both input flows, interruption and resume, browser
+and read-only Git access, update/rollback, and uninstall ownership boundaries.
+Network acceptance requires a successful request, a negative test after losing
+`tun0`, a working independent control case, and successful restoration. Never push
+to a repository just to test connectivity.
 
-Firefox остаётся экспериментальным до проверки proxy-side DNS и отсутствия direct
-fallback на фактической версии. Chrome сохраняет защитный DNS-флаг с объяснённым
-предупреждением. Основные профили браузеров не меняются.
+Firefox remains experimental until proxy-side DNS and the absence of direct
+fallback are verified on the actual browser version. Chrome retains its DNS
+protection flag with an explanation of the warning. Main browser profiles remain
+unchanged.
 
-Историческая Windows Home/WSL приёмка находится в [HISTORY.md](HISTORY.md).
-Она не подтверждает новый мастер, нового пользователя или Firefox. Docker-приёмка
-на исходной машине отложена владельцем; это не повод объявлять Docker проверенным.
+Historical Windows Home/WSL acceptance is recorded in [HISTORY.md](HISTORY.md).
+It does not validate the new wizard, a new user's environment, or Firefox.
+The original machine owner deferred Docker acceptance; do not report Docker as
+verified on that basis.
 
-## Восстановление и снятие доступа
+## Recovery and access revocation
 
-`vpn-gateway doctor` — неразрушающая диагностика. При расхождении внешнего пути
-подключение блокируется до ввода credentials. Никаких автоматических изменений
-`.wslconfig`, Firewall, routes/DNS, глобального Git/SSH или ослабления TLS.
+`vpn-gateway doctor` provides non-destructive diagnostics. An external-path
+mismatch blocks connection before credentials are requested. The gateway does
+not automatically change `.wslconfig`, Windows Firewall, routes/DNS, or global
+Git/SSH settings, and does not weaken TLS.
 
-`vpn-gateway stop` удаляет временный VPN auth. `uninstall --backend wsl` удаляет
-только owned distro; полный `uninstall` также убирает установленные команды,
-совпадающую собственную PATH-запись и восстанавливает записанные предыдущие локальные
-Git-значения. Чужие изменения не перетираются, WSL/Docker целиком не удаляются.
+`vpn-gateway stop` removes temporary VPN auth material. `uninstall --backend wsl`
+removes only the owned distro. Full `uninstall` also removes installed commands
+and a matching owned PATH entry, and restores recorded previous repository-local
+Git values. Unrelated changes are not overwritten; WSL and Docker themselves
+are not removed.
 
-Git tokens/passwords в обычном credential helper — отдельная авторизация. Их отзыв
-выполняется по правилам организации, а не удалением произвольных Windows credentials.
+Git tokens/passwords stored by a normal credential helper are separate from VPN
+authentication. Revoke them through your organization's procedures, not by
+deleting arbitrary Windows credentials.

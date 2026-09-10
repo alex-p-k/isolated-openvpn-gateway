@@ -55,7 +55,9 @@ vpn-gateway git check PATH_TO_REPOSITORY --remote
 vpn-gateway stop
 ```
 
-[Русский quickstart](QUICKSTART.md) · [Windows diagnostics](WINDOWS.md) ·
+The primary documentation is maintained in English.
+
+[Quickstart](QUICKSTART.md) · [Windows diagnostics](WINDOWS.md) ·
 [Rollback/update](ROLLBACK.md) · [Safe handoff](HANDOFF.md)
 
 `start` without `--open-browser` stays terminal-only. Repeated setup preserves

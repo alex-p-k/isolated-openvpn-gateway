@@ -1,87 +1,94 @@
-# Быстрый старт для разработчика
+# Developer quickstart
 
-Нужны Windows 11 Home/Pro, Python 3.11+ и выданный IT профиль `.ovpn`
-либо комплект `gateway.toml` + профили. Docker для WSL-варианта не нужен.
-Корпоративный OpenVPN запускается только внутри изолированного Linux.
+You need Windows 11 Home or Pro, Python 3.11+, and an IT-issued `.ovpn` profile
+or a kit containing `gateway.toml` and its profiles. The WSL backend does not
+require Docker. Corporate OpenVPN runs only inside the isolated Linux environment.
 
-## 1. Установить
+## 1. Install
 
-Клонируйте этот репозиторий, откройте обычный PowerShell в его каталоге:
+Clone this repository and open a normal, non-administrator PowerShell window in
+the checkout directory:
 
 ```powershell
 .\setup.cmd
 ```
 
-Мастер проверит Python и выбранный backend, предложит WSL для новой Windows-установки,
-импортирует профиль, подтвердит внешний VPN-адаптер и подготовит отдельный дистрибутив.
-Оригинал `.ovpn` не изменяется. Один endpoint с явным портом и протоколом поддерживается;
-скрипты, неоднозначные профили и внешние security-файлы не импортируются автоматически.
+The wizard checks Python and the selected backend, recommends WSL for a new
+Windows installation, imports your profile, asks you to confirm the external VPN
+adapter, and provisions a dedicated distro. The original `.ovpn` stays unchanged.
+Single-endpoint profiles with an explicit port and protocol are supported; scripts,
+ambiguous profiles, and external certificate/key files are not imported automatically.
 
-Если Python отсутствует — установите поддерживаемый Python 3.11+ по
-[официальной инструкции](https://www.python.org/downloads/windows/), откройте новый терминал
-и повторите команду. Если WSL отсутствует, его включение выполняется отдельно в
-PowerShell администратора:
+If Python is missing, install a maintained Python 3.11+ release from the
+[official Windows download page](https://www.python.org/downloads/windows/),
+open a new terminal, and retry. If WSL is missing, enable it separately in an
+administrator PowerShell window:
 
 ```powershell
 wsl --install --no-distribution
 ```
 
-Перезагрузитесь, если Windows попросит, затем снова запустите мастер обычным
-пользователем. Hyper-V Manager и upgrade до Pro не нужны.
-[Официальная установка WSL](https://learn.microsoft.com/windows/wsl/install).
-Сетевые режимы, Firewall, Windows routes/DNS мастер не меняет.
+Restart Windows if prompted, then rerun the wizard as your normal user. Neither
+Hyper-V Manager nor an upgrade to Windows Pro is required. See the
+[official WSL installation guide](https://learn.microsoft.com/windows/wsl/install).
+The wizard does not change networking mode, Windows Firewall, host routes, or DNS.
 
-Согласитесь на User PATH, если хотите короткие команды. После установки откройте
-**новое окно PowerShell**: повторять ручные `$env:Path` больше не нужно.
-Загрузка Debian и сборка Dante могут занять несколько минут. При отмене Ctrl+C
-или ошибке повторите `.\setup.cmd`: завершённые принадлежащие проекту этапы сохраняются.
+Accept User PATH registration if you want to use short command names. After setup,
+open a **new PowerShell window**; you will no longer need to set `$env:Path`
+manually for each session. Downloading Debian and building Dante may take several
+minutes. If you cancel with Ctrl+C or a stage fails, rerun `.\setup.cmd`:
+completed project-owned stages are preserved.
 
-Для заранее подготовленных входных параметров:
+You can supply input paths in advance:
 
 ```powershell
 .\setup.cmd --backend wsl --ovpn "C:\Secure\company.ovpn"
 .\setup.cmd --backend wsl --config "C:\Secure\gateway.toml" --profiles-dir "C:\Secure\profiles"
 ```
 
-Подтверждения изменений всё равно интерактивные; это не unattended installer.
+Changes still require interactive confirmation; this is not an unattended installer.
 
-## 2. Подключиться и открыть браузер
+## 2. Connect and open the corporate browser
 
-Включите внешний VPN, затем:
+Connect your external VPN, then run:
 
 ```powershell
 vpn-gateway start --open-browser
 ```
 
-Preflight проверит внешний маршрут и совпадение Windows/backend egress **до**
-ввода корпоративного логина/пароля и повторно после него. Оба поля скрыты.
-Не передавайте credentials в чат, аргументах, переменных среды или конфигурации.
+Preflight checks the external route and verifies that Windows and the selected
+backend have the same public egress **before** asking for your corporate username
+and password, and again after you enter them. Both inputs are hidden. Never share
+credentials in chat or pass them through command arguments, environment variables,
+or configuration files.
 
-При первой настройке выберите браузер и укажите свой корпоративный стартовый URL.
-Для подключения без браузера используйте `vpn-gateway start`.
-Для уже подключённого шлюза:
+During setup, choose a browser and provide your corporate start URL. To connect
+without opening a browser, use `vpn-gateway start`. If the gateway is already
+connected:
 
 ```powershell
 vpn-gateway browser
 vpn-gateway status
 ```
 
-`vpn-browser` остаётся совместимым alias. Chrome может показывать предупреждение
-о `--host-resolver-rules`: флаг блокировки локального DNS сохранён, предупреждение
-не скрывается. Firefox добавлен как явный **экспериментальный** выбор: отдельный
-профиль, без изменения основного Firefox. Его сетевые гарантии требуют приёмки;
-настройки сами по себе не доказательство. Сменить сохранённый выбор:
+`vpn-browser` remains a compatible alias. Chrome may warn about
+`--host-resolver-rules`: the local-DNS protection flag is retained, and the warning
+is not hidden. Firefox is an explicit, **experimental** option with a separate
+profile; your main Firefox profile is not changed. Its network guarantees still
+require acceptance testing; preferences alone are not proof of isolation.
+To change your saved browser choice:
 
 ```powershell
 vpn-gateway setup --browser firefox --url https://YOUR-CORPORATE-HOST/
 ```
 
-Подставьте свой адрес. Если Firefox-профиль уже открыт, используйте его окно либо
-закройте только этот профиль и повторите запуск; основной браузер не закрывается.
+Replace the placeholder with your own URL. If the separate Firefox profile is
+already open, use its window or close only that profile and retry. The launcher
+does not close your main browser.
 
-## 3. Настроить Git — необязательно
+## 3. Configure Git — optional
 
-Репозиторий остаётся на NTFS. Глобальный proxy не меняется.
+Your repository stays on NTFS. No global Git proxy is changed.
 
 ```powershell
 vpn-gateway git configure "C:\work\corporate-repository"
@@ -89,12 +96,13 @@ vpn-gateway git check "C:\work\corporate-repository"
 vpn-gateway git check "C:\work\corporate-repository" --remote
 ```
 
-Первая команда покажет план локальной настройки и запросит подтверждение.
-Вторая проверит её без сети. Третья выполнит read-only `ls-remote` через proxy.
-Git-авторизация/SSH host key настраиваются локально отдельно; отсутствие авторизации
-не означает успешную проверку доступа. Никакого push или автоматического clone.
+The first command previews repository-local changes and asks for confirmation.
+The second checks configuration without network access. The third performs a
+read-only `ls-remote` through the proxy. Set up Git authentication and SSH host-key
+trust separately on your machine; an authentication failure is not a successful
+access check. These commands never push or automatically clone a repository.
 
-## Если что-то не работает
+## Troubleshoot
 
 ```powershell
 vpn-gateway doctor
@@ -103,16 +111,18 @@ vpn-gateway status --verbose
 vpn-gateway logs
 ```
 
-Doctor ничего не чинит и не прерывает VPN. Непроведённые проверки обозначаются явно.
-Если команда не найдена — сначала откройте новый терминал. Для старой установки
-используйте её фактический launcher, затем мастер; не переустанавливайте WSL ради PATH.
-Особенности старых MSIX-путей описаны в [ROLLBACK.md](ROLLBACK.md).
+Doctor does not repair settings or interrupt the VPN. Checks that were not run are
+marked explicitly. If a command is not found, first open a new terminal. For a
+legacy installation, use its actual launcher path and then the setup wizard;
+do not reinstall WSL just to fix PATH. Legacy MSIX paths are covered in
+[ROLLBACK.md](ROLLBACK.md).
 
-`ready` означает готовность туннеля/SOCKS, не доступ к приложению. Проверьте свой URL
-через `vpn-gateway test https://YOUR-CORPORATE-HOST/`. Отсутствующий pushed DNS
-не подменяется выдуманным сервером.
+`ready` means the tunnel and SOCKS are ready, not that a particular application is
+reachable. Test your URL with `vpn-gateway test https://YOUR-CORPORATE-HOST/`.
+If no corporate DNS was pushed, the gateway reports that fact; it does not invent
+a DNS server address.
 
-## Остановить, обновить, удалить
+## Stop, update, or uninstall
 
 ```powershell
 vpn-gateway stop
@@ -121,22 +131,24 @@ vpn-gateway uninstall --backend wsl
 vpn-gateway uninstall
 ```
 
-Update запускается из нового checkout и требует подтверждения остановки. Backend-only
-uninstall удаляет только управляемый дистрибутив; полный uninstall — принадлежащую
-проекту установку, её PATH-запись и совпадающие локальные Git-изменения.
-WSL/Docker целиком и чужие browser profiles не удаляются.
-[Границы rollback](ROLLBACK.md).
+These are separate operations, not a sequence to run together. Update runs from
+a new checkout and asks for permission to stop the gateway. Backend-only uninstall
+removes only the managed distro; full uninstall also removes the project-owned
+installation and PATH entry, and rolls back matching repository-local Git changes.
+It does not remove WSL or Docker themselves, or unrelated browser profiles.
+See [rollback and ownership boundaries](ROLLBACK.md).
 
-`compare-transports` — отдельная **разрушающая текущие соединения** приёмка:
-завершите Git-передачи перед ней. Не запускайте её как обычную диагностику.
+`compare-transports` is a separate acceptance test that **interrupts active
+connections**. Finish Git transfers before running it; do not use it as routine
+diagnostics.
 
-## macOS и приёмка
+## macOS and acceptance testing
 
-На macOS сохранены Docker backend и исходная установка через
-`python3 install.py --config ... --profiles-dir ...`; добавлен также
-`python3 install.py --wizard --backend docker`.
-Команды ставятся в `~/.local/bin`; shell PATH пользователь настраивает отдельно.
+The macOS Docker backend and the original
+`python3 install.py --config ... --profiles-dir ...` installation remain supported.
+You can also use `python3 install.py --wizard --backend docker`. Commands are
+installed in `~/.local/bin`; configure your shell PATH separately.
 
-Новая Windows/Firefox-приёмка: [UX_ACCEPTANCE.md](UX_ACCEPTANCE.md).
-Исторические сетевые результаты: [HISTORY.md](HISTORY.md).
-Профили, сертификаты, cookies, credentials, backup и сырую диагностику в Git не добавляйте.
+Current Windows/Firefox acceptance: [UX_ACCEPTANCE.md](UX_ACCEPTANCE.md).
+Historical network results: [HISTORY.md](HISTORY.md).
+Never commit profiles, certificates, cookies, credentials, backups, or raw diagnostics.
