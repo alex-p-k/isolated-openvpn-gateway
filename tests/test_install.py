@@ -219,7 +219,7 @@ class GitTests(unittest.TestCase):
     def test_https_is_scoped_to_selected_repository_and_url(self):
         url = 'https://corp.example.invalid/team/repo.git'
         self.add_remote(url)
-        with patch('builtins.input', return_value='origin'):
+        with patch('git_integration.confirm', return_value=True):
             gateway.configure_git(self.repo)
         value = gateway.run(['git', '-C', self.repo, 'config', '--local', '--get', 'http.'+url+'.proxy'])
         self.assertEqual(value.stdout.strip(), 'socks5h://127.0.0.1:1080')
@@ -230,9 +230,8 @@ class GitTests(unittest.TestCase):
     def test_existing_ssh_override_is_not_overwritten(self):
         self.add_remote('git@corp.example.invalid:team/repo.git')
         gateway.run(['git', '-C', self.repo, 'config', '--local', 'core.sshCommand', 'ssh -v'])
-        with patch('builtins.input', return_value='origin'), patch.dict(os.environ, {'GIT_SSH':'', 'GIT_SSH_COMMAND':''}):
-            with self.assertRaises(gateway.GatewayError):
-                gateway.configure_git(self.repo)
+        with patch('git_integration.confirm', return_value=False), patch.dict(os.environ, {'GIT_SSH':'', 'GIT_SSH_COMMAND':''}):
+            gateway.configure_git(self.repo)
         self.assertFalse((gateway.ROOT/'config').exists())
 
     def test_ssh_config_preserves_other_host_and_blocks_master_reuse(self):
@@ -261,7 +260,7 @@ class GitTests(unittest.TestCase):
 
     def test_uninstalled_source_cannot_stop_existing_gateway(self):
         with patch.object(sys, 'argv', ['vpn-gateway', 'stop']), patch.object(gateway, 'compose') as compose:
-            with self.assertRaises(gateway.GatewayError):
+            with self.assertRaises(gateway.ProductError):
                 gateway.main()
             compose.assert_not_called()
 

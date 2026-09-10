@@ -7,7 +7,9 @@ Windows has two independent backends:
 - `docker`: Docker Desktop, Linux containers and the `desktop-linux` context;
 - `wsl`: a project-owned WSL2 Debian distro named `IsolatedOpenVPNGateway`, without Docker Desktop.
 
-The existing command remains compatible and uses the backend saved at installation (default: `docker`):
+The existing command remains compatible and uses the backend saved at installation.
+The Windows wizard recommends WSL for a new installation; legacy installations
+and the low-level installer keep their existing Docker default:
 
 ```text
 vpn-gateway start
@@ -28,6 +30,39 @@ all ordinary host traffic
 ```
 
 It is not a VPN server, a system-wide VPN, a public proxy, or a tool for installing corporate OpenVPN on Windows.
+
+## Start here — source install for developers
+
+On Windows, install Python 3.11+ and the chosen backend prerequisites, clone this
+repository, and run:
+
+```powershell
+.\setup.cmd
+```
+
+The terminal wizard imports one compatible IT-issued `.ovpn` or a prepared TOML
+kit, confirms the outer VPN adapter, provisions the dedicated backend, and offers
+user-PATH registration, a browser choice and repository-local Git setup.
+No Docker is needed for WSL. No full Hyper-V role or Windows Pro upgrade is needed.
+
+Open a new terminal after opting into PATH. Daily commands:
+
+```text
+vpn-gateway start --open-browser
+vpn-gateway status
+vpn-gateway doctor
+vpn-gateway git check PATH_TO_REPOSITORY --remote
+vpn-gateway stop
+```
+
+[Русский quickstart](QUICKSTART.md) · [Windows diagnostics](WINDOWS.md) ·
+[Rollback/update](ROLLBACK.md) · [Safe handoff](HANDOFF.md)
+
+`start` without `--open-browser` stays terminal-only. Repeated setup preserves
+the selected backend and private deployment. To update the installed CLI from a
+new verified checkout, use `.\setup.cmd --update`; no automatic update/download
+of application code is performed. Firefox is explicit opt-in and experimental
+until its real network acceptance is complete; Chrome remains supported.
 
 ## Windows support matrix
 
@@ -61,9 +96,9 @@ Microsoft states that WSL2 is available on Windows 10/11 Home through the `Virtu
 Common:
 
 - Python 3.11 or newer;
-- Git;
+- Git only for cloning the source or using Git integration; browser-only operation does not require Git;
 - x86_64/AMD64 or ARM64 Windows, or arm64/x86_64 macOS;
-- Chrome, Chromium or Edge only if the isolated browser is wanted;
+- Chrome/Chromium/Edge, or explicitly selected Firefox 128+ (use a maintained release), only for browser integration;
 - an already connected outer VPN when `require_outer_vpn=true`.
 
 Docker backend:
@@ -106,7 +141,7 @@ required_inline_blocks = ["ca", "tls-auth"]
 
 Do not guess corporate hostnames or DNS addresses. `dns_canary` is a harmless private name supplied by the deployment owner. If OpenVPN pushes no DNS, status reports that fact and does not invent an address.
 
-## Verify and install
+## Advanced IT-kit installation (legacy interface)
 
 macOS (Docker backend):
 
@@ -147,7 +182,7 @@ Installation paths:
 | macOS | `~/.local/share/isolated-openvpn-gateway` | `~/.local/bin/vpn-gateway`, `vpn-browser` | `~/.local/share/isolated-openvpn-browser` |
 | Windows | `%LOCALAPPDATA%\IsolatedOpenVPNGateway` | `...\bin\vpn-gateway.cmd`, `vpn-browser.cmd` | `%LOCALAPPDATA%\IsolatedOpenVPNBrowser` |
 
-No command is added to a persistent User or Machine PATH. If PowerShell reports `vpn-gateway` is not recognized, repeat the installer's two session-only PATH setup lines in that window, or invoke the full launcher path with `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status`. Quoting a path alone does not execute it in PowerShell. Packaged-terminal installations may have a physical root under `Packages\...\LocalCache`; use the returned path instead of reconstructing it from `%LOCALAPPDATA%`. `--profiles-dir` resolves `profile_file`; repeated `--profile NAME=PATH` supports separate private directories.
+The low-level legacy installer does not register PATH. The new setup wizard offers opt-in persistent **User** PATH and records the physical install location under HKCU; Machine PATH and PowerShell profiles remain untouched. If PowerShell reports `vpn-gateway` is not recognized, repeat the installer's two session-only PATH setup lines in that window, or invoke the full launcher path with `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' status`. Quoting a path alone does not execute it in PowerShell. Packaged-terminal installations may have a physical root under `Packages\...\LocalCache`; use the returned path instead of reconstructing it from `%LOCALAPPDATA%`. `--profiles-dir` resolves `profile_file`; repeated `--profile NAME=PATH` supports separate private directories.
 
 ## Commands and backend choice
 
@@ -158,7 +193,12 @@ vpn-gateway backend set docker|wsl
 vpn-gateway start [TRANSPORT] [--backend docker|wsl]
 vpn-gateway stop
 vpn-gateway restart [TRANSPORT]
-vpn-gateway status
+vpn-gateway setup
+vpn-gateway status [--json] [--verbose]
+vpn-gateway doctor [--json]
+vpn-gateway browser [URL] [--browser firefox|chromium]
+vpn-gateway git configure PATH [--remote-name NAME]
+vpn-gateway git check PATH [--remote] [--remote-name NAME]
 vpn-gateway logs
 vpn-gateway test [https://private-host/]
 vpn-gateway compare-transports [--backend docker|wsl]
@@ -188,9 +228,31 @@ Clients resolve target hostnames proxy-side:
 - HTTPS Git: repository-local `http.<exact-url>.proxy=socks5h://127.0.0.1:PORT`;
 - SSH Git: repository-local `core.sshCommand` and a hostname-preserving SOCKS stdio bridge;
 - Chromium/Edge: separate profile, SOCKS5, proxy-side DNS rules, QUIC/direct WebRTC disabled, no `direct://` fallback;
-- Firefox is not launched automatically; if configured manually, enable proxy DNS over SOCKS5 and use a separate profile.
+- Firefox: explicit choice, separate owned profile, manual SOCKS5 with remote DNS, direct bypass/DoH/HTTP3/WebRTC disabled in that profile. No global policies or main-profile changes.
 
 No global Git proxy, global SSH `ProxyCommand`, remote URL or repository content is changed. Repositories remain on NTFS. Test with a read-only `git -C PATH ls-remote REMOTE`; never push merely for acceptance.
+
+Chrome's warning about `--host-resolver-rules` is intentional upstream behavior;
+the flag is retained to block local DNS. It is not hidden with testing flags.
+See [Chromium's warning list](https://github.com/chromium/chromium/blob/main/chrome/browser/ui/startup/bad_flags_prompt.cc).
+Firefox avoids that particular Chrome flag, but its settings are not by themselves
+proof of isolation. Existing Chrome profiles are not migrated or deleted.
+Mozilla defines SOCKS5 remote DNS separately in its
+[network preferences](https://github.com/mozilla/gecko-dev/blob/master/modules/libpref/init/StaticPrefList.yaml).
+Our browser acceptance procedure checks hostname transmission and requires DNS
+observation; writing that preference alone is not treated as a passing network test.
+
+`git configure` previews a local change, requires confirmation for writes, and
+returns “already configured” for matching effective settings. It refuses conflicting
+environment and `remote.proxy` overrides. `git check` is local-only unless `--remote` is requested;
+authentication failures are distinct from successful repository access. Neither
+command clones or pushes.
+
+`status` and `doctor` provide JSON with `schema_version: 1`, a state, categorized
+checks and the next action. States are `not_configured`, `stopped`, `connecting`,
+`ready`, `blocked`, `error`. A ready tunnel does not prove a private application
+works. Doctor performs read-only inspection and never calls disruptive preflight,
+transport comparison, repairs, or session teardown. Skipped checks say `not_checked`.
 
 ## Validation and rollback
 
@@ -213,22 +275,8 @@ See `WINDOWS.md` for acceptance and NAT/mirrored handling, `ROLLBACK.md` for exa
 - Docker: [Install Docker Desktop on Windows](https://docs.docker.com/desktop/setup/install/windows-install/)
 - Docker: [Docker Desktop WSL2 backend](https://docs.docker.com/desktop/features/wsl/)
 
-## Verification status of this revision
+## Verification status
 
-The development host is Windows 11 Home Single Language, 25H2, build `26200.9168`, AMD64. On 2026-09-07, WSL 2.7.12, dedicated Debian WSL2, systemd, `/dev/net/tun`, OpenVPN and Dante 1.4.4 were installed/checked without Docker. NAT egress timed out; after separate owner approval and a recorded absent-file backup, mirrored mode passed Windows/root-WSL/nested-namespace egress equality and outer-adapter route checks.
-
-Actual corporate OpenVPN initialization and pushed-DNS payloads through the Windows SOCKS forwarder passed on two supplied UDP profiles. For each, stopping only OpenVPN removed tun0 and blocked SOCKS; a working root outer HTTPS control, blocked proxy UID and increased firewall REJECT counter independently proved enforcement. The tunnel and successful SOCKS payload were then restored. Windows routes/DNS, ordinary IPv4 egress and global Git proxy stayed unchanged. The listener was IPv4 loopback-only. Validation enters the nested gateway namespace for tunnel/route/firewall checks. After the clone completed, paired IPv4/IPv6 DNS and route snapshots passed across a controlled stop, fresh outer preflight and successful reconnect, including a private HTTPS payload. This does not establish public IPv6 egress equality.
-
-Repeated WSL outer egress timeouts blocked the TCP transport check and restoration after an earlier comparison; safe cleanup removed credentials and the listener. Subsequent unauthenticated outer diagnostics passed again. The intermittent failure remains a limitation, not evidence of an outer-VPN bypass. After another interactive start, the supplied private task-tracker URL returned HTTPS 302 through SOCKS with TLS verification enabled. The SSH bridge's short-packet buffering bug was fixed. After interactive HTTPS Git authentication, the full NTFS clone completed: HEAD resolved, the tracked worktree was clean, and a second read-only remote query passed using only the repository-local `socks5h` setting, without a process-level proxy override. No push was performed. The user confirmed that the tracker opens in the dedicated Chrome profile; this is manual positive evidence, not automated visual inspection.
-
-The console-free WSL forwarder update was applied after the clone finished. The owner confirmed that the dedicated browser cannot open the tracker with the gateway off, completing the manual browser positive/negative check. After separate approval, the installed PowerShell listener script passed with process-only `RemoteSigned`; persistent policy was unchanged. The live check confirmed IPv4/IPv6 probe controls, IPv4 loopback access, and blocked `::1`/non-loopback local interfaces.
-
-After fixing a namespace-start race, the full installed WSL comparison completed on 2026-09-07. Both UDP transport keys passed all positive/negative controls, the final UDP session was restored and validated, and Windows IPv4/IPv6 DNS/routes, public IPv4 egress and global Git settings matched the initial comparison baseline. A subsequent private HTTPS request returned 302 with TLS verification enabled. The TCP443 attempt did not initialize: its configured HTTP-proxy endpoint timed out from both root WSL and the gateway namespace, while independent outer HTTPS controls passed in both. This is a real failed TCP attempt, not a successful TCP fail-closed test; the endpoint/path cause remains unresolved. Original profiles were not modified.
-
-Remote LAN-device acceptance remains incomplete. Docker Desktop failed before its Linux engine became available. The owner's manual backup rename of the first blocked socket succeeded outside the agent session; a subsequent launch failed on a different Inference-manager socket. The owner explicitly deferred Docker acceptance and chose WSL only. Docker and its data remain installed; its repair is not required by this backend. No real Docker-backend acceptance was performed. macOS compatibility is covered by tests/mocks, not a real macOS run. See `WINDOWS.md` for the evidence boundaries.
-
-An owner-approved full WSL uninstall was subsequently verified on this Home machine: stop removed credentials, tun0, the nested namespace and Windows listener; uninstall removed only the managed distro, gateway files and four matching repository-local Git keys. Host IPv4/IPv6 routes/DNS, public IPv4, global Git, original IT profiles, the NTFS repository and the optionally retained browser profile were preserved. The CMD launcher initially reported failure after successfully deleting itself; its fix passed an actual Windows-layer uninstall with exit code zero, plus direct/CALL synthetic tests for both success and failure codes. WSL full uninstall no longer contacts an unrelated installed Docker engine. Reinstallation requires fresh interactive credentials; earlier network acceptance must not be reported as proof of a newly reinstalled connection.
-
-Reinstallation completed at the same physical root with the saved WSL backend and recorded Git settings. Fresh credential-free preflight passed Windows/root-WSL/nested-namespace public IPv4 equality and the configured outer route; systemd was available. The temporary diagnostic namespace was removed, with no credentials, OpenVPN or listener left running. Host IPv4/IPv6 routes/DNS and ordinary IPv4 egress still matched the pre-uninstall baseline.
-
-After the owner's fresh interactive start, the reinstalled UDP session passed corporate pushed DNS and HTTPS 302 through SOCKS, plus read-only Git using the restored repository-local proxy. A new paired test confirmed a successful SOCKS payload before stopping only OpenVPN, absent tun0 and blocked SOCKS afterward, a working independent outer control and firewall rejection of forced proxy-UID outer traffic. The original session was restored after another outer preflight; corporate HTTPS/DNS and host IPv4/IPv6 routes/DNS, public IPv4 and global Git passed again. The owner also confirmed that the tracker opens in the separate Chrome after a cache-bypassing refresh. This is fresh manual browser-positive evidence; the browser-negative check belongs to the earlier installation. This repeated acceptance covers the current UDP transport, not a new comparison of every profile or a remote LAN-device test.
+Prior Windows Home/WSL evidence and limitations are preserved in [HISTORY.md](HISTORY.md).
+The new setup/update/Firefox layer is not covered by that historical acceptance.
+See [UX_ACCEPTANCE.md](UX_ACCEPTANCE.md) for the new, explicitly separated release gates.

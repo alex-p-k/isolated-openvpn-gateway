@@ -520,6 +520,7 @@ class WindowsBrowserTests(unittest.TestCase):
                  patch.object(browser.host, 'browser_candidates', return_value=(executable,)), \
                  patch.object(browser.host, 'secure_windows_acl'), \
                  patch.object(browser, 'load_config', return_value=self._config()), \
+                 patch.object(browser, 'gateway_ready', return_value=True), \
                  patch.object(browser.subprocess, 'CREATE_NEW_PROCESS_GROUP', 1, create=True), \
                  patch.object(browser.subprocess, 'DETACHED_PROCESS', 8, create=True), \
                  patch.object(browser.subprocess, 'Popen', side_effect=popen):

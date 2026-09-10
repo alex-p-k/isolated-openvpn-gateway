@@ -6,6 +6,10 @@
 /dist/
 /installation.json
 /settings.json
+/setup-state.json
+/update-pending.json
+/path-registration.json
+/location-registration.json
 /git-changes.json
 /gateway.toml
 /.codegraph/

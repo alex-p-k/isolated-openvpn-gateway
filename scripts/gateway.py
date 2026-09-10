@@ -17,11 +17,13 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
+from types import SimpleNamespace
 
 from gateway_config import (BROWSER_CLI, CLI, PROJECT, SOCKS_IMAGE, VPN_IMAGE,
                             ConfigError, load_config)
 import host
 import wsl_backend
+from product import ProductError, error_text
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / 'runtime'
@@ -40,6 +42,11 @@ FORWARDER_PID = RUNTIME / 'wsl-forwarder.pid'
 
 class GatewayError(Exception):
     pass
+
+
+def api():
+    """Current bindings, also when loaded through importlib by offline tests."""
+    return SimpleNamespace(**globals())
 
 def configuration():
     path = ROOT / 'gateway.toml'
@@ -315,7 +322,12 @@ def network_snapshot():
                             r'^(http\..*proxy|http\.proxy|core\.sshCommand|url\..*\.insteadOf)$']}
     data = {'captured_at': time.time(), 'public_ip':public_ip()}
     for key, cmd in commands.items():
-        r = run(cmd, check=False)
+        try:
+            r = run(cmd, check=False)
+        except FileNotFoundError:
+            if key != 'git_global_proxy':
+                raise
+            r = subprocess.CompletedProcess(cmd, 127, '', 'Git is not installed (optional).')
         data[key] = {'code':r.returncode, 'stdout':r.stdout, 'stderr':r.stderr}
     required = ('dns','routes','default','public_route')
     if host.IS_WINDOWS:
@@ -454,12 +466,20 @@ def install_backend(selected):
             raise GatewayError('WSL could not install the separate Debian distro. A reboot or one-time '
                                'Administrator WSL enablement may be required.')
         created = True
+        # Establish ownership before slow provisioning so an interrupted install
+        # can resume without unregistering an already created distro.
+        wsl('/usr/bin/install', '-d', '-m', '0700', '/etc/isolated-openvpn-gateway', timeout=30)
+        wsl('/usr/bin/tee', '/etc/isolated-openvpn-gateway/ownership.json',
+            input=json.dumps({'project': PROJECT, 'managed': True}), timeout=30)
+        wsl('/usr/bin/chmod', '0600', '/etc/isolated-openvpn-gateway/ownership.json', timeout=30)
+        update_installation(wsl_distro=WSL_DISTRO, wsl_created_by_project=True,
+                            wsl_location=str(location), wsl_install_phase='provisioning')
         listing = run([WSL, '--list', '--verbose'], timeout=20)
         if wsl_backend.distro_version(listing.stdout, WSL_DISTRO) != 2:
             run([WSL, '--set-version', WSL_DISTRO, '2'], timeout=300, capture=False)
         provision_wsl_backend(location)
     except BaseException:
-        if created:
+        if created and not wsl_owned():
             run(wsl_backend.unregister_command(executable=WSL), check=False, timeout=180, capture=False)
             update_installation(wsl_distro=None, wsl_created_by_project=False, wsl_location=None)
         with contextlib.suppress(OSError):
@@ -469,8 +489,10 @@ def install_backend(selected):
 
 def provision_wsl_backend(location):
     print('Installing OpenVPN, Dante, firewall and diagnostic packages in the managed WSL distro.', flush=True)
+    print('[WSL 1/4] Refreshing package metadata.', flush=True)
     wsl('/usr/bin/env', 'DEBIAN_FRONTEND=noninteractive', '/usr/bin/apt-get',
         '-o', 'APT::Update::Error-Mode=any', 'update', timeout=600, capture=False)
+    print('[WSL 2/4] Installing Linux dependencies.', flush=True)
     wsl('/usr/bin/env', 'DEBIAN_FRONTEND=noninteractive', '/usr/bin/apt-get', 'install',
         '-y', '--no-install-recommends', 'openvpn', 'iproute2', 'iptables',
         'curl', 'ca-certificates', 'python3', 'slirp4netns', 'util-linux', timeout=900, capture=False)
@@ -484,10 +506,12 @@ def provision_wsl_backend(location):
         ROOT/'scripts'/'wsl_manager.py': ('/opt/isolated-openvpn-gateway/wsl_manager.py', '0555'),
         ROOT/'scripts'/'wsl_sockd.conf': ('/etc/isolated-openvpn-gateway/sockd.conf', '0444'),
     }
+    print('[WSL 3/4] Installing gateway assets and verified Dante build.', flush=True)
     for source, (destination, mode) in assets.items():
         copy_wsl_asset(source, destination, mode)
     wsl('/usr/bin/env', 'DEBIAN_FRONTEND=noninteractive', '/usr/bin/python3',
         '/opt/isolated-openvpn-gateway/wsl_dependencies.py', timeout=900, capture=False)
+    print('[WSL 4/4] Configuring managed units and verifying restart.', flush=True)
     wsl('/usr/bin/python3', '/opt/isolated-openvpn-gateway/wsl_manager.py', 'provision', timeout=60)
     update_installation(wsl_distro=WSL_DISTRO, wsl_created_by_project=True,
                         wsl_location=str(location), wsl_install_phase='ready')
@@ -732,6 +756,12 @@ def prompt_credentials(backend='docker'):
 
 def derive_config(source, expected=None):
     """Only known profile directives are accepted; embedded keys are opaque data."""
+    from profile_import import normalize
+    from product import ProductError
+    try:
+        source, _metadata = normalize(source)
+    except ProductError as exc:
+        raise GatewayError(str(exc)) from None
     allowed = {'dev','persist-tun','persist-key','data-ciphers','data-ciphers-fallback','ncp-ciphers',
                'cipher','auth','tls-client','client','resolv-retry','remote','nobind','auth-user-pass',
                'remote-cert-tls','explicit-exit-notify','setenv','key-direction','http-proxy',
@@ -766,7 +796,11 @@ def derive_config(source, expected=None):
             raise GatewayError('Malformed profile directive.') from None
         key = p[0]
         if key not in allowed:
-            raise GatewayError('Unexpected profile directive; manual review required: '+key)
+            unsupported = {'up', 'down', 'route-up', 'route-pre-down', 'plugin', 'script-security',
+                           'ca', 'cert', 'key', 'pkcs12', 'config', 'cd', 'management', 'log', 'log-append',
+                           'daemon', 'writepid', 'tls-auth', 'tls-crypt', 'askpass', 'connection'}
+            safe_key = key if key in unsupported else '[unrecognized]'
+            raise GatewayError('Unexpected profile directive; manual review required: '+safe_key)
         if key == 'remote':
             remotes.append(p)
         if key == 'http-proxy':
@@ -785,6 +819,8 @@ def derive_config(source, expected=None):
             # OpenVPN 2.6 alias normalized without broadening the cipher list.
             output.append('data-ciphers '+' '.join(p[1:])); modern=True; continue
         if key == 'cipher':
+            if len(p) != 2:
+                raise GatewayError('Malformed cipher directive.')
             cipher = p[1]
         if key == 'data-ciphers-fallback':
             cipher = None
@@ -1263,53 +1299,8 @@ def repository_ssh_settings(remote_host, config_path):
             repository_ssh_config(remote_host))
 
 def configure_git(repo):
-    repo=Path(repo).expanduser().resolve()
-    remotes=run(['git','-C',repo,'remote']).stdout.strip()
-    if not remotes:
-        raise GatewayError('Repository has no remotes. No Git settings changed.')
-    print('Repository remotes:', ', '.join(remotes.splitlines()))
-    remote=input('Private remote NAME to configure (e.g. origin): ').strip()
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+',remote):
-        raise GatewayError('Invalid remote name')
-    fetch_urls=run(['git','-C',repo,'remote','get-url','--all',remote]).stdout.splitlines()
-    push_urls=run(['git','-C',repo,'remote','get-url','--push','--all',remote]).stdout.splitlines()
-    if len(fetch_urls) != 1 or push_urls != fetch_urls:
-        raise GatewayError('Separate/multiple fetch or push URLs need manual scoped review; nothing changed.')
-    url=fetch_urls[0]
-    u=urlsplit(url)
-    config, config_text = None, None
-    if u.scheme == 'https':
-        safe_target(url)
-        cfg = configuration()
-        key='http.'+url+'.proxy'; value='socks5h://%s:%d' % (cfg['socks_host'],cfg['socks_port'])
-    else:
-        remote_host=u.hostname if u.scheme == 'ssh' else (re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url).group(1)
-                if re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):.+',url) else None)
-        if not remote_host or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*',remote_host) or u.password:
-            raise GatewayError('Unsupported remote URL')
-        if os.environ.get('GIT_SSH_COMMAND') or os.environ.get('GIT_SSH'):
-            raise GatewayError('An environment SSH override exists; review it before configuring the proxy.')
-        key='core.sshCommand'
-        config=ROOT/'config'/('ssh-repo-'+hashlib.sha256(str(repo).encode()).hexdigest()[:16]+'.conf')
-        if os.path.lexists(config):
-            raise GatewayError('A private SSH configuration already exists; refusing to overwrite it.')
-        value, config_text = repository_ssh_settings(remote_host, config)
-    scope=['--local'] if key != 'core.sshCommand' else []
-    previous=run(['git','-C',repo,'config',*scope,'--get-all',key],check=False)
-    if previous.returncode == 0:
-        raise GatewayError('Existing proxy/SSH setting found. Review it manually; nothing overwritten.')
-    git_config=Path(run(['git','-C',repo,'rev-parse','--path-format=absolute','--git-path','config']).stdout.strip())
-    backup=ROOT/'backups'/('git-config-'+str(time.time_ns())+'.backup')
-    private_write(backup,git_config.read_text())
-    if config:
-        private_write(config,config_text)
-    run(['git','-C',repo,'config','--local',key,value])
-    records=read_json(ROOT/'git-changes.json',[])
-    records.append({'repo':str(repo),'key':key,'value':value,'backup':str(backup)})
-    private_write(ROOT/'git-changes.json',json.dumps(records,indent=2))
-    test_command=['git','-C',str(repo),'ls-remote',remote]
-    rendered=subprocess.list2cmdline(test_command) if host.IS_WINDOWS else shlex.join(test_command)
-    print('Configured repository only. Read-only test: '+rendered)
+    import git_integration
+    return git_integration.configure(api(), repo)
 
 def uninstall():
     if input('Remove only '+PROJECT+' and its launchers? Type REMOVE: ') != 'REMOVE':
@@ -1320,9 +1311,11 @@ def uninstall():
     selected = active_backend()
     stop_internal(backend=selected)
     for record in read_json(ROOT/'git-changes.json',[]):
-        r=run(['git','-C',record['repo'],'config','--local','--get',record['key']],check=False)
-        if r.stdout.strip() == record['value']:
+        r=run(['git','-C',record['repo'],'config','--local','--get-all',record['key']],check=False)
+        if r.stdout.splitlines() == [record['value']]:
             run(['git','-C',record['repo'],'config','--local','--unset-all',record['key']])
+            for previous in record.get('previous', []):
+                run(['git','-C',record['repo'],'config','--local','--add',record['key'],previous])
         elif r.returncode == 0:
             raise GatewayError('Repository configuration changed since installation; preserve gateway and review rollback manually.')
     marker = read_json(ROOT/'installation.json')
@@ -1336,7 +1329,8 @@ def uninstall():
         for image in (IMAGE,SOCKS_IMAGE):
             docker('image','rm',image,check=False)
     profile=host.browser_root()
-    delete_profile=profile.exists() and input('Also delete the separate private browser profile? Type DELETE PROFILE: ') == 'DELETE PROFILE'
+    browser_profiles = [profile, profile.with_name(profile.name + '-Firefox')]
+    delete_profile=any(p.exists() for p in browser_profiles) and input('Also delete the separate private browser profiles? Type DELETE PROFILE: ') == 'DELETE PROFILE'
     names = [CLI, BROWSER_CLI]
     if marker.get('legacy_aliases'):
         names += ['corp-vpn','corp-browser']
@@ -1349,9 +1343,14 @@ def uninstall():
     if marker.get('project') != PROJECT or not host.installation_root_matches(ROOT, marker):
         raise GatewayError('Installation ownership check failed; refusing deletion.')
     if delete_profile:
-        if not (profile/'.isolated-openvpn-gateway-owned').is_file():
-            raise GatewayError('Browser profile ownership marker is absent; refusing deletion.')
-        shutil.rmtree(profile)
+        for profile in browser_profiles:
+            if profile.exists():
+                if profile.is_symlink() or not (profile/'.isolated-openvpn-gateway-owned').is_file():
+                    raise GatewayError('Browser profile ownership marker is absent; refusing deletion.')
+                shutil.rmtree(profile)
+    if host.IS_WINDOWS:
+        import path_integration
+        path_integration.unregister(ROOT)
     if host.IS_WINDOWS:
         # main() removes ROOT after the Windows lock handle is closed.
         return True
@@ -1365,22 +1364,37 @@ def usage():
     except GatewayError:
         names = 'TRANSPORT'
     print(CLI+' install --backend wsl|docker\n'
-          '            start [TRANSPORT] [--backend docker|wsl] | stop | restart [TRANSPORT]\n'
-          '            status | logs | test [URL] | compare-transports [--backend docker|wsl]\n'
+          '            setup [--help] | --version\n'
+          '            start [TRANSPORT] [--backend docker|wsl] [--open-browser] | stop | restart [TRANSPORT]\n'
+          '            status [--json] [--verbose] | doctor [--json] | browser [URL] [--browser firefox|chromium]\n'
+          '            git configure PATH | git check PATH [--remote] [--remote-name NAME]\n'
+          '            logs | test [URL] | compare-transports [--backend docker|wsl]\n'
           '            backend set docker|wsl | git-configure [repo] | build | uninstall [--backend wsl]\n'
           'Configured transports: '+names)
 
-def main():
+def main(argv=None):
     os.umask(0o077)
-    action, positionals, explicit_backend = parse_cli(sys.argv[1:])
+    import cli_ui
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    handled, result = cli_ui.dispatch(api(), arguments)
+    if handled:
+        return result
+    open_browser = '--open-browser' in arguments
+    if open_browser:
+        if not arguments or arguments[0] != 'start' or arguments.count('--open-browser') != 1:
+            raise ProductError('USAGE', '--open-browser is accepted once with start.', 'vpn-gateway start --open-browser')
+        arguments.remove('--open-browser')
+    action, positionals, explicit_backend = parse_cli(arguments)
     if action in ('--help','-h','help'):
         usage()
         return 0
     marker = read_json(ROOT/'installation.json')
     if marker.get('project') != PROJECT or not host.installation_root_matches(ROOT, marker):
         command = str(host.command_directory(ROOT)/((CLI+'.cmd') if host.IS_WINDOWS else CLI))
-        raise GatewayError('Run install.py first, then use '+command+
-                           '; do not run lifecycle commands from the source archive.')
+        raise ProductError('NOT_INSTALLED', 'Lifecycle commands require an owned installation.', 'Run .\\setup.cmd from the checkout.')
+    if (ROOT/'update-pending.json').exists():
+        raise ProductError('UPDATE_INCOMPLETE', 'An application update needs recovery before lifecycle commands can run.',
+                           'Run .\\setup.cmd from a verified source checkout.')
     RUNTIME.mkdir(mode=0o700,exist_ok=True)
     delete_after_unlock = False
     with host.maybe_lifecycle_lock(ROOT/'.lock', action not in ('status','logs','test')):
@@ -1393,21 +1407,34 @@ def main():
             if selected not in cfg['transports']:
                 raise GatewayError('Usage: '+CLI+' start ['+'|'.join(cfg['transports'])+']')
             if action == 'start' and ready(selected_backend):
-                print('Already connected. Use '+CLI+' restart to switch sessions.'); status(selected_backend); return
+                print('Already connected. Use '+CLI+' restart to switch sessions.')
+                if open_browser:
+                    import browser
+                    browser.main([])
+                return 0
             stop_internal(backend=selected_backend)
             completed = False
+            in_preflight = True
             try:
+                cli_ui.record(api(), 'connecting')
                 preflight(selected_backend)
+                in_preflight = False
                 prompt_credentials(selected_backend)
                 # Input can take arbitrarily long; never start on the basis
                 # of the pre-prompt outer path alone.
+                in_preflight = True
                 preflight(selected_backend)
+                in_preflight = False
                 if not start_transport(selected, backend=selected_backend):
                     raise GatewayError('VPN not ready. See '+CLI+' logs; try another configured transport.')
                 private_write(RUNTIME/'active-backend', selected_backend+'\n')
                 if not ready(selected_backend):
                     raise GatewayError('VPN readiness was lost before startup completed.')
+                cli_ui.record(api(), 'ready')
                 completed = True
+            except BaseException:
+                cli_ui.record(api(), 'blocked' if in_preflight else 'error')
+                raise
             finally:
                 if not completed:
                     stop_internal(backend=selected_backend)
@@ -1419,6 +1446,7 @@ def main():
             for name in ('client.ovpn','selected-transport','active-backend'):
                 (RUNTIME/name).unlink(missing_ok=True)
             print('Gateway stopped; ephemeral credentials removed.')
+            cli_ui.record(api(), 'stopped')
         elif action == 'status': status(active_backend(explicit_backend))
         elif action == 'logs': logs(active_backend(explicit_backend))
         elif action == 'test':
@@ -1466,6 +1494,9 @@ def main():
                 os.chdir(Path.home())
         shutil.rmtree(ROOT)
         print('Gateway removed. Docker Desktop, outer VPN, repositories and global network/Git settings were preserved.')
+    if open_browser:
+        import browser
+        browser.main([])
     return 0
 
 if __name__ == '__main__':
@@ -1480,6 +1511,6 @@ if __name__ == '__main__':
         else:
             print('\nCancelled.',file=sys.stderr)
         sys.exit(130)
-    except (GatewayError, subprocess.TimeoutExpired, BlockingIOError, OSError) as exc:
-        print('ERROR:',str(exc),file=sys.stderr)
+    except (GatewayError, ProductError, subprocess.TimeoutExpired, BlockingIOError, OSError) as exc:
+        print(error_text(exc),file=sys.stderr)
         sys.exit(1)

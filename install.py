@@ -24,9 +24,12 @@ PACKAGE_FILES = (
     'scripts/wsl_sockd.conf', 'tests/test_gateway.py', 'tests/test_wsl.py',
     'tests/test_install.py', 'tests/test_windows.py', 'tests/test_listener_windows.py', 'tests/test_forwarder.py', 'tools/build_release.py',
     'tools/windows_acceptance.ps1', 'tests/test_wsl_process.py',
+    'setup.cmd', 'scripts/product.py', 'scripts/profile_import.py',
+    'scripts/path_integration.py', 'scripts/setup_wizard.py', 'scripts/cli_ui.py',
+    'scripts/git_integration.py', 'tests/test_product.py', 'UX_ACCEPTANCE.md', 'tools/browser_probe.py', 'HISTORY.md',
 )
 INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
-    'install.py', 'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',
+    'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',
     'tests/test_windows.py',
 ))
 
@@ -127,7 +130,7 @@ def requirements(gateway, hostlib, backend='docker'):
         raise InstallError('--backend must be docker or wsl.')
     if backend == 'wsl' and system != 'Windows':
         raise InstallError('The native WSL2 backend is available only on Windows.')
-    checks = [('Git', ['git', '--version'])]
+    checks = []  # Git is optional until a repository integration is requested.
     if backend == 'docker':
         if not Path(gateway.DOCKER).is_file():
             raise InstallError('Docker Desktop CLI not found; choose --backend wsl on Windows or install Docker Desktop.')
@@ -151,8 +154,7 @@ def requirements(gateway, hostlib, backend='docker'):
             raise InstallError('Docker Desktop must use Linux containers; Windows containers are unsupported.')
         print(name + ': available')
     print(system + ' architecture: ' + platform.machine() + '; Python: ' + platform.python_version())
-    print('Browser: available' if any(p.is_file() for p in hostlib.browser_candidates())
-          else 'Browser: install Chrome/Chromium/Edge before using vpn-browser (Git does not require it).')
+    print('Browser: optional; choose it in vpn-gateway setup.')
 
 
 def write_private(path, data, mode=0o600, hostlib=None, system=None):
@@ -244,6 +246,12 @@ def install_files(package, target_home, profiles, python_executable, config_byte
             for link in links:
                 link.symlink_to(root / 'bin' / link.name)
                 created_links.append(link)
+        metadata['app_hashes'] = {name: digest((root/name).read_bytes()) for name in INSTALL_FILES}
+        if system == 'Windows':
+            for name in commands:
+                relative = 'bin/' + name + '.cmd'
+                metadata['app_hashes'][relative] = digest((root/relative).read_bytes())
+        hostlib.private_write(root/'installation.json', json.dumps(metadata, indent=2)+'\n', system=system)
     except BaseException:
         for link in created_links:
             if link.is_symlink() and link.resolve().is_relative_to(root):
@@ -291,6 +299,12 @@ def windows_shell_instructions(root, backend):
 
 
 def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if '--wizard' in arguments:
+        arguments.remove('--wizard')
+        sys.path.insert(0, str(PACKAGE/'scripts'))
+        import setup_wizard
+        return setup_wizard.main(arguments, package=PACKAGE)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='read-only environment/profile checks; no installation')
     parser.add_argument('--config', type=Path, help='private deployment gateway.toml')
@@ -301,7 +315,7 @@ def main(argv=None):
                         help='also create corp-vpn/corp-browser aliases if those names are unused')
     parser.add_argument('--backend', choices=('docker','wsl'), default='docker',
                         help='initial backend; wsl is Docker-free and Windows-only')
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     os.umask(0o077)
     sys.dont_write_bytecode = True
     verify_manifest(PACKAGE)
@@ -358,8 +372,13 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    sys.path.insert(0, str(PACKAGE/'scripts'))
+    from product import ProductError, error_text
     try:
         sys.exit(main())
-    except (InstallError, OSError) as exc:
-        print('ERROR: ' + str(exc), file=sys.stderr)
+    except KeyboardInterrupt:
+        print('Cancelled. Completed owned stages are preserved; rerun setup to resume.', file=sys.stderr)
+        sys.exit(130)
+    except (InstallError, ProductError, ValueError, OSError) as exc:
+        print(error_text(exc), file=sys.stderr)
         sys.exit(1)

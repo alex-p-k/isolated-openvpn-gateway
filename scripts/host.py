@@ -36,6 +36,23 @@ def install_root(home=None, environ=None, system=None):
     system = SYSTEM if system is None else system
     if system == 'Windows':
         base = local_app_data(home, environ, native=native)
+        if native and IS_WINDOWS:
+            import winreg
+            candidates = []
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\IsolatedOpenVPNGateway') as key:
+                    value, _ = winreg.QueryValueEx(key, 'InstallRoot')
+                    candidates.append(Path(value))
+            except FileNotFoundError:
+                pass
+            launcher = shutil.which('vpn-gateway.cmd')
+            if launcher:
+                candidates.append(Path(launcher).parent.parent)
+            for candidate in candidates:
+                if (candidate.name == 'IsolatedOpenVPNGateway' and candidate.is_absolute()
+                        and candidate.is_relative_to(base) and not candidate.is_symlink()
+                        and (candidate/'installation.json').is_file()):
+                    return candidate
         root = base/'IsolatedOpenVPNGateway'
         if native and (root/'installation.json').is_file():
             # File redirection can differ from directory redirection in MSIX.
@@ -146,6 +163,17 @@ def browser_candidates(home=None, environ=None, system=None):
             Path('/Applications/Chromium.app/Contents/MacOS/Chromium'),
             home/'Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
             home/'Applications/Chromium.app/Contents/MacOS/Chromium')
+
+
+def firefox_candidates(home=None, environ=None, system=None):
+    home = Path.home() if home is None else Path(home)
+    environ = os.environ if environ is None else environ
+    system = SYSTEM if system is None else system
+    if system == 'Windows':
+        return tuple(Path(environ[key])/'Mozilla Firefox'/'firefox.exe'
+                     for key in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA') if environ.get(key))
+    return (Path('/Applications/Firefox.app/Contents/MacOS/firefox'),
+            home/'Applications/Firefox.app/Contents/MacOS/firefox')
 
 
 def ssh_executable(environ=None, system=None):
@@ -311,3 +339,27 @@ def maybe_lifecycle_lock(path, enabled):
             yield
     else:
         yield
+
+
+def lifecycle_busy(path):
+    """Read-only nonblocking probe: never create or write the lock file."""
+    try:
+        handle = Path(path).open('rb')
+    except FileNotFoundError:
+        return False
+    with handle:
+        if IS_WINDOWS:
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBRLCK, 1)
+            except OSError:
+                return True
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    return False

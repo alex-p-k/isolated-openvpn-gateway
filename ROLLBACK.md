@@ -67,7 +67,7 @@ Record the absent-file case explicitly rather than claiming a file backup exists
 
 ## Failed WSL provisioning
 
-If `vpn-gateway install --backend wsl` created the distro in the same attempt and provisioning then failed, the command unregisters that newly created distro as transaction rollback and clears its Windows ownership metadata. It never unregisters a distro that existed before the attempt.
+If WSL creation established matching ownership and provisioning then failed, the distro is preserved for `vpn-gateway setup` to resume. It never adopts or unregisters a pre-existing unowned distro. If creation failed before ownership could be established, inspect the original installation error and ownership before retrying; do not delete a same-named distro blindly.
 
 If enterprise tooling interrupted the process, inspect safely:
 
@@ -92,7 +92,7 @@ Linux PID files alone are not proof that a process still belongs to the gateway.
 
 ## Post-rollback checks
 
-The installer's Windows command-name setup changes only `$env:Path` in the current PowerShell process. Close that window to discard it; User/Machine PATH, registry and PowerShell profiles are not modified. Closing the shell does not itself stop the separately running gateway. To stop explicitly without PATH setup, use `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' stop` with the actual `Installed:` root, including any packaged-terminal redirection.
+The legacy install.py instructions only change the current shell PATH. The new wizard can register one owned **User** PATH entry and stores physical-root discovery in `HKCU\\Software\\IsolatedOpenVPNGateway`. Full uninstall removes only matching owned entries and restores prior repository-local Git values; it never rewrites the whole user PATH, Machine PATH or PowerShell profiles. Closing the shell does not itself stop the separately running gateway. To stop explicitly without PATH setup, use `& 'ACTUAL-INSTALLED-ROOT\bin\vpn-gateway.cmd' stop` with the actual `Installed:` root, including any packaged-terminal redirection.
 
 After stop/uninstall/rollback, confirm:
 
@@ -108,3 +108,41 @@ Use the read-only portions of `tools\windows_acceptance.ps1` or the commands in 
 If an outer-path check fails during transport comparison, the command stops and removes ephemeral credentials. It must not restore a corporate session over an unverified outer path. Once the external VPN and backend egress pass again, run `vpn-gateway start --backend wsl` and enter credentials interactively; do not recover an auth file from a backup. A successful positive/negative test earlier in the comparison does not mean the final session was restored: check the final status separately.
 
 Private `validation/comparison.json` records comparison stages, completion and cleanup attempts, including separate original and cleanup error categories. `cleanup_attempted` alone is not proof that credentials were removed or services stopped. Confirm with current gateway status and listener checks; a report left incomplete by a crash is not a successful acceptance. These files can contain private deployment diagnostics and must not be included in a handoff or committed.
+
+## Product CLI update and rollback
+
+From a new verified checkout, run `.\setup.cmd --update`. Updates support installed
+versions `2026.09.01.2` and `2026.09.10.1`. Compatibility is checked before
+confirmation. The tool stops the gateway only after approval, serializes application
+writes, and saves only allowlisted application files under private
+`backups/app-update-TIMESTAMP`. It refuses unexpected symlinks and recorded file drift.
+The original private inputs, browser profiles and WSL disk are not update backups.
+The legacy `2026.09.01.2` marker has no application hash inventory: its first update
+relies on installation ownership and unchanged Linux assets, and saves the current
+allowlisted CLI files for rollback. Later updates also verify recorded application
+hashes. Preserve and review any known local CLI modifications before this first update.
+
+This update path is for the CLI product layer: changed Linux runtime assets require
+a separately reviewed backend migration. It will not silently leave changed Linux
+assets deployed in one environment but absent in another. macOS command symlinks and
+its existing Python interpreter are preserved.
+
+A failed write/smoke check restores the prior application files. A crash leaves
+`update-pending.json`; lifecycle commands refuse to start until the verified
+checkout's setup recovers it. Do not edit the journal or restore auth files.
+The gateway remains stopped after rollback/update; a new start requires fresh
+credentials. Backups remain private for inspection and are removed with full uninstall.
+
+For an old redirected MSIX installation that is not yet discoverable in PATH/HKCU,
+supply its recorded physical root explicitly:
+
+```powershell
+.\setup.cmd --update --installed-root 'ACTUAL-INSTALLED-ROOT'
+.\setup.cmd --installed-root 'ACTUAL-INSTALLED-ROOT'
+```
+
+The second command offers user PATH integration. It does not move the installation,
+change the backend or reinstall an already provisioned WSL distro. Never substitute
+a guessed or unrelated directory. New ordinary-terminal installations need no such
+legacy-location option. PATH journal and location records are private and excluded
+from the source package. Existing shells must be reopened after registration/removal.

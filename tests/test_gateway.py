@@ -575,7 +575,10 @@ class InteractiveStartPreflightTests(unittest.TestCase):
 
     def test_write_failure_cleans_up_even_if_started_session_is_ready(self):
         self.calls['ready'].side_effect = [False, True]
-        self.calls['private_write'].side_effect = OSError('synthetic state-write failure')
+        def fail_active_backend(path, *_args, **_kwargs):
+            if path.name == 'active-backend':
+                raise OSError('synthetic state-write failure')
+        self.calls['private_write'].side_effect = fail_active_backend
         with self.assertRaises(OSError):
             gateway.main()
         self.calls['start_transport'].assert_called_once()
