@@ -82,7 +82,7 @@ class HostTests(unittest.TestCase):
         for remove in (False, True):
             for code in (0, 7):
                 with self.subTest(remove=remove, code=code), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)/"Test (O'Brien $name)"
+                    root = Path(tmp).resolve()/"Test (O'Brien $name)"
                     (root/'bin').mkdir(parents=True)
                     (root/'scripts').mkdir()
                     launcher = root/'bin/vpn-gateway.cmd'
@@ -102,7 +102,7 @@ class HostTests(unittest.TestCase):
                     # A user's wrapper may CALL the launcher and continue; it
                     # must receive the same exit status without being closed.
                     launcher.write_bytes(host.batch_launcher(sys.executable, 'gateway.py'))
-                    caller = Path(tmp)/'caller.cmd'
+                    caller = Path(tmp).resolve()/'caller.cmd'
                     caller.write_text('@echo off\ncall "'+str(launcher)+'" '+str(code)+' '+
                         ('remove' if remove else 'keep')+'\nexit /b %errorlevel%\n')
                     called = subprocess.run([os.environ.get('ComSpec','cmd.exe'),'/d','/c',str(caller)],
@@ -127,11 +127,11 @@ class HostTests(unittest.TestCase):
     def test_failed_windows_acl_removes_new_private_object(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(host, 'secure_windows_acl', side_effect=OSError('ACL failed')):
-            directory = Path(tmp)/'private'
+            directory = Path(tmp).resolve()/'private'
             with self.assertRaises(OSError):
                 host.private_directory(directory, system='Windows')
             self.assertFalse(directory.exists())
-            file = Path(tmp)/'private.txt'
+            file = Path(tmp).resolve()/'private.txt'
             with self.assertRaises(OSError):
                 host.private_write(file, 'private', system='Windows')
             self.assertFalse(file.exists())
@@ -142,7 +142,7 @@ class HostTests(unittest.TestCase):
                                locking=lambda fd, mode, size: calls.append((mode, size)))
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(host, 'IS_WINDOWS', True), patch.dict(sys.modules, {'msvcrt': fake}):
-            with host.lifecycle_lock(Path(tmp)/'gateway.lock'):
+            with host.lifecycle_lock(Path(tmp).resolve()/'gateway.lock'):
                 self.assertEqual(calls, [(1, 1)])
         self.assertEqual(calls, [(1, 1), (2, 1)])
 
@@ -153,7 +153,7 @@ class HostTests(unittest.TestCase):
             'windows_outer_adapter_contains = ["REPLACE-WITH-OUTER-VPN-ADAPTER"]',
             'windows_outer_adapter_contains = ["Outer VPN", "Outer VPN"]')
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp)/'gateway.toml'; path.write_text(text)
+            path = Path(tmp).resolve()/'gateway.toml'; path.write_text(text)
             value = configlib.load_config(path)
             path.write_text(text.replace('["Outer VPN", "Outer VPN"]', '["x"]'))
             with self.assertRaises(configlib.ConfigError):
@@ -165,7 +165,7 @@ class WindowsInstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='gateway-windows-install-')
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         self.home = self.base/'Windows User'
         self.home.mkdir()
         self.local = self.home/'AppData'/'Local'
@@ -427,7 +427,7 @@ class WindowsGatewayTests(unittest.TestCase):
             'git.private.example', 'C:/missing/user-config', 'C:/missing/system-config',
             proxy_command=proxy)
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp)/'ssh.conf'; path.write_text(text)
+            path = Path(tmp).resolve()/'ssh.conf'; path.write_text(text)
             ssh = shutil.which('ssh')
             if not ssh:
                 self.skipTest('OpenSSH client is unavailable')
@@ -439,11 +439,11 @@ class WindowsGatewayTests(unittest.TestCase):
 
     def test_windows_uninstall_defers_root_removal_until_lock_is_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)/'IsolatedOpenVPNGateway'; root.mkdir()
+            root = Path(tmp).resolve()/'IsolatedOpenVPNGateway'; root.mkdir()
             (root/'installation.json').write_text('{"project":"isolated-openvpn-gateway"}')
             with patch.object(gateway.host, 'IS_WINDOWS', True), \
                  patch.object(gateway.host, 'install_root', return_value=root), \
-                 patch.object(gateway.host, 'browser_root', return_value=Path(tmp)/'absent-browser'), \
+                 patch.object(gateway.host, 'browser_root', return_value=Path(tmp).resolve()/'absent-browser'), \
                  patch.object(gateway, 'ROOT', root), patch('builtins.input', return_value='REMOVE'), \
                  patch.object(gateway, 'stop_internal'), patch.object(gateway, 'docker'):
                 self.assertTrue(gateway.uninstall())
@@ -452,15 +452,15 @@ class WindowsGatewayTests(unittest.TestCase):
     def test_full_uninstall_contacts_only_selected_docker_backend(self):
         for backend, windows in (('wsl', True), ('docker', True), ('docker', False)):
             with self.subTest(backend=backend, windows=windows), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)/'IsolatedOpenVPNGateway'; root.mkdir()
+                root = Path(tmp).resolve()/'IsolatedOpenVPNGateway'; root.mkdir()
                 (root/'installation.json').write_text('{"project":"isolated-openvpn-gateway"}')
-                executable = Path(tmp)/'docker.exe'; executable.write_bytes(b'synthetic only')
+                executable = Path(tmp).resolve()/'docker.exe'; executable.write_bytes(b'synthetic only')
                 with patch.object(gateway, 'ROOT', root), \
                      patch.object(gateway, 'DOCKER', str(executable)), \
                      patch.object(gateway, 'active_backend', return_value=backend), \
                      patch.object(gateway.host, 'IS_WINDOWS', windows), \
                      patch.object(gateway.host, 'install_root', return_value=root), \
-                     patch.object(gateway.host, 'browser_root', return_value=Path(tmp)/'absent'), \
+                     patch.object(gateway.host, 'browser_root', return_value=Path(tmp).resolve()/'absent'), \
                      patch('builtins.input', return_value='REMOVE'), \
                      patch.object(gateway, 'stop_internal') as stop, \
                      patch.object(gateway, 'docker') as docker:
@@ -475,7 +475,7 @@ class WindowsGatewayTests(unittest.TestCase):
     def test_windows_main_removes_root_only_after_lock_context_closes(self):
         events = []
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)/'IsolatedOpenVPNGateway'; root.mkdir()
+            root = Path(tmp).resolve()/'IsolatedOpenVPNGateway'; root.mkdir()
             runtime = root/'runtime'
             (root/'installation.json').write_text('{"project":"isolated-openvpn-gateway"}')
 
@@ -503,7 +503,7 @@ class WindowsGatewayTests(unittest.TestCase):
 class WindowsBrowserTests(unittest.TestCase):
     def test_windows_browser_uses_detached_process_and_isolated_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp); root = base/'IsolatedOpenVPNGateway'; root.mkdir()
+            base = Path(tmp).resolve(); root = base/'IsolatedOpenVPNGateway'; root.mkdir()
             profile = base/'IsolatedOpenVPNBrowser'; executable = base/'msedge.exe'
             executable.write_bytes(b'fixture')
             (root/'installation.json').write_text('{"project":"isolated-openvpn-gateway"}')
@@ -519,6 +519,7 @@ class WindowsBrowserTests(unittest.TestCase):
                  patch.object(browser.host, 'install_root', return_value=root), \
                  patch.object(browser.host, 'browser_candidates', return_value=(executable,)), \
                  patch.object(browser.host, 'secure_windows_acl'), \
+                 patch.object(browser.host, 'lifecycle_lock', side_effect=lambda _: contextlib.nullcontext()), \
                  patch.object(browser, 'load_config', return_value=self._config()), \
                  patch.object(browser, 'gateway_ready', return_value=True), \
                  patch.object(browser.subprocess, 'CREATE_NEW_PROCESS_GROUP', 1, create=True), \

@@ -211,3 +211,19 @@ After separate owner approval, real full WSL-only uninstall acceptance passed: c
 Reinstallation completed at the previous physical root with WSL still selected and local Git keys restored. Fresh credential-free preflight confirmed equal Windows/root-WSL/namespace public IPv4, the expected outer route, and systemd. The diagnostic namespace was removed. Before interactive startup, OpenVPN, credentials, and the listener were absent, while Windows IPv4/IPv6 routes/DNS and external IPv4 egress were preserved.
 
 The owner then entered credentials locally. The new UDP session passed pushed-DNS, corporate HTTPS 302 with TLS verification, and read-only Git checks through the restored repository-local proxy. A repeated paired fail-closed test confirmed a successful SOCKS payload before stopping OpenVPN, no tun0 or SOCKS access afterwards, a successful independent outer control, and firewall REJECT enforcement for a forced outbound attempt by the proxy UID. After fresh outer preflight, the original transport was restored; HTTPS, DNS, host IPv4/IPv6 routes/DNS, public IPv4, and global Git preservation were checked again. The session was left working. The owner again confirmed that the tracker opened in the separate Chrome profile after Ctrl+Shift+R. This is a manual positive result; the negative browser test belongs to the previous installation. Not all profiles or a remote LAN device were tested in this repeat; TCP and IPv6 limitations remain.
+
+
+## 2026-09-11 — macOS parity and reliability
+
+Migrated the working Mac Docker installation from 2026.08.30.1 to 2026.09.11.1.
+Changes address observed issues: credential cleanup skipped by stop exceptions,
+stale readiness and unmeasured macOS listener assertions, nonportable test fixtures,
+missing Mac migration workflow and developer quickstart. Added a staged-image,
+private-backup migration and explicit rollback, preserved old image tags and
+unrelated legacy aliases, and restored transport/uptime in detailed status.
+
+Acceptance also exposed a hardcoded Docker firewall-test result. The replacement
+requires a direct positive control and an observed firewall rejection, independently
+of the later tunnel-loss check. See UX_ACCEPTANCE.md for measured PASS/NOT RUN
+results and the browser/DNS-observer limitations. No host networking settings or
+main browser profiles were changed.

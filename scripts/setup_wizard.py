@@ -135,7 +135,7 @@ def checked_destination(root, name):
 
 def update_allowlist(installer):
     return set(installer.INSTALL_FILES) | {
-        'bin/'+name+'.cmd' for name in ('vpn-gateway', 'vpn-browser', 'corp-vpn', 'corp-browser')}
+        'bin/'+name+'.cmd' for name in ('vpn-gateway', 'vpn-browser', 'corp-vpn', 'corp-browser')} | {'bin/vpn-gateway', 'bin/vpn-browser'}
 
 
 def verify_installed_files(root, marker, installer):
@@ -153,7 +153,7 @@ def update_files(package, root, installer):
     if package.resolve() == root.resolve():
         raise ProductError('UPDATE_SOURCE', 'Update must run from a new verified source checkout.', 'Run .\\setup.cmd --update in the checkout.')
     marker = owned(root)
-    if marker.get('kit_version') not in ('2026.09.01.2', '2026.09.10.1'):
+    if marker.get('kit_version') not in ('2026.09.01.2', '2026.09.10.1', '2026.09.11.1'):
         raise ProductError('UPDATE_VERSION', 'This installed version has no reviewed in-place migration.', 'Use the documented private-input-preserving migration workflow.')
     installer.verify_manifest(package)
     # Validate installed deployment against this version before stopping anything.
@@ -256,7 +256,9 @@ def main(argv=None, package=None):
     parser.add_argument('--outer-adapter')
     parser.add_argument('--browser', choices=('chromium', 'firefox', 'skip'))
     parser.add_argument('--url')
+    parser.add_argument('--rollback-docker', action='store_true', help='restore the recorded macOS Docker migration backup')
     parser.add_argument('--update', action='store_true')
+    parser.add_argument('--migrate-docker', action='store_true', help='reviewed macOS Docker runtime migration; requires --update')
     parser.add_argument('--installed-root', type=Path, help='explicit owned legacy/MSIX installation to resume or update')
     args = parser.parse_args(argv)
     if not sys.stdin.isatty():
@@ -273,10 +275,23 @@ def main(argv=None, package=None):
         owned(root)
         with host.lifecycle_lock(root/'.setup.lock'):
             recover_update(root, installer)
+    if args.rollback_docker:
+        if args.update or args.migrate_docker:
+            parser.error('--rollback-docker cannot be combined with update')
+        with host.lifecycle_lock(root/'.setup.lock'):
+            import docker_migration
+            docker_migration.rollback(package, root, installer)
+            return 0
+    if args.migrate_docker and not args.update:
+        parser.error('--migrate-docker requires --update')
     if args.update:
         if not exists:
             raise ProductError('NOT_INSTALLED', 'There is no installation to update.', 'Run .\\setup.cmd without --update.')
         with host.lifecycle_lock(root/'.setup.lock'):
+            if args.migrate_docker:
+                import docker_migration
+                docker_migration.migrate(package, root, installer)
+                return 0
             return 0 if update_files(package, root, installer) else 0
     if exists and (args.ovpn or args.config or args.outer_adapter):
         raise ProductError('SETUP_EXISTING', 'Existing private deployment inputs are preserved; importing over them is not supported.',

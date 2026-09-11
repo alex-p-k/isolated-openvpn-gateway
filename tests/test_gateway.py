@@ -595,3 +595,132 @@ class InteractiveStartPreflightTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class LiveSafetyTests(unittest.TestCase):
+    def test_stop_timeout_still_removes_host_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            auth = pathlib.Path(directory)/'auth'; auth.write_text('synthetic')
+            with patch.object(gateway, 'AUTH', auth), patch.object(gateway, 'compose', side_effect=subprocess.TimeoutExpired(['docker'], 35)):
+                with self.assertRaises(gateway.ProductError) as caught:
+                    gateway.stop_internal()
+            self.assertFalse(auth.exists())
+            self.assertIn('Service stop: failed', str(caught.exception))
+            self.assertIn('container credential lifetime unverified', str(caught.exception))
+
+    def test_stop_reports_cleanup_failure_even_when_service_stop_succeeds(self):
+        with patch.object(gateway, '_stop_services'), patch.object(gateway, 'cleanup_auth', side_effect=PermissionError('PRIVATE')):
+            with self.assertRaises(gateway.ProductError) as caught:
+                gateway.stop_internal()
+        self.assertIn('Service stop: completed', str(caught.exception))
+        self.assertIn('cleanup: failed or unverified', str(caught.exception))
+        self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_controlled_comparison_keeps_auth(self):
+        with patch.object(gateway, '_stop_services'), patch.object(gateway, 'cleanup_auth') as cleanup:
+            gateway.stop_internal(keep_auth=True)
+        cleanup.assert_not_called()
+
+    def test_macos_listener_rejects_wildcard_lan_ipv6_and_unavailable(self):
+        for names, expected in [('n127.0.0.1:1080', True), ('n*:1080', False),
+                                ('n127.0.0.1:1080\nn[::]:1080', False),
+                                ('n192.0.2.1:1080', False), ('n[::1]:1080', False)]:
+            with self.subTest(names=names), patch.object(gateway.host, 'IS_WINDOWS', False), \
+                 patch.object(gateway, 'configuration', return_value=CONFIG), \
+                 patch.object(gateway, 'run', return_value=subprocess.CompletedProcess([],0,'p123\n'+names+'\n','')):
+                self.assertIs(gateway.listener_result()['loopback_only'], expected)
+        with patch.object(gateway.host, 'IS_WINDOWS', False), patch.object(gateway, 'configuration', return_value=CONFIG), \
+             patch.object(gateway, 'run', side_effect=FileNotFoundError):
+            self.assertIsNone(gateway.listener_result()['loopback_only'])
+
+    def test_stale_ready_and_unrelated_socks_cannot_pass_without_owned_containers(self):
+        with patch.object(gateway, 'read_json', return_value={'ready': True}), \
+             patch.object(gateway, 'socks_available', return_value=True), \
+             patch.object(gateway, 'docker', return_value=subprocess.CompletedProcess([],0,'linux','')), \
+             patch.object(gateway, 'container_id', return_value=''):
+            self.assertFalse(gateway.ready())
+
+    def test_docker_readiness_requires_each_live_control(self):
+        from copy import deepcopy
+        labels = {'com.docker.compose.project':gateway.PROJECT,
+                  'com.docker.compose.project.working_dir':str(gateway.ROOT)}
+        details = [{'Id':'vpn-id', 'State':{'Running':True},
+                    'Config':{'Labels':dict(labels, **{'com.docker.compose.service':'vpn'})},
+                    'HostConfig':{'PortBindings':{'1080/tcp':[{'HostIp':'127.0.0.1','HostPort':'1080'}]}}},
+                   {'Id':'socks-id','State':{'Running':True},
+                    'Config':{'Labels':dict(labels, **{'com.docker.compose.service':'socks'})},
+                    'HostConfig':{'NetworkMode':'container:vpn-id'}}]
+        for fault in (None, 'owner', 'network', 'health', 'address', 'listener', 'initialization'):
+            current=deepcopy(details)
+            if fault=='owner':current[0]['Config']['Labels']['com.docker.compose.project']='foreign'
+            if fault=='network':current[1]['HostConfig']['NetworkMode']='bridge'
+            def docker(*args, **kwargs):
+                if args[0]=='info':return subprocess.CompletedProcess([],0,'linux','')
+                if args[0]=='inspect':return subprocess.CompletedProcess([],0,json.dumps(current),'')
+                if args[-1]=='health':return subprocess.CompletedProcess([],1 if fault=='health' else 0,'','')
+                return subprocess.CompletedProcess([],0,'' if fault=='address' else 'inet 192.0.2.10/24','')
+            with self.subTest(fault=fault), patch.object(gateway,'configuration',return_value=CONFIG), \
+                 patch.object(gateway,'container_id',side_effect=lambda service:service+'-id'), \
+                 patch.object(gateway,'docker',side_effect=docker), \
+                 patch.object(gateway,'read_json',return_value={'ready':True,'initialization_completed':fault!='initialization'}), \
+                 patch.object(gateway,'listener_result',return_value={'listener_present':True,'loopback_only':None if fault=='listener' else True}), \
+                 patch.object(gateway,'socks_available',return_value=True):
+                self.assertEqual(gateway.ready(), fault is None)
+
+
+class FirewallEvidenceTests(unittest.TestCase):
+    def test_docker_probe_does_not_pass_without_positive_control(self):
+        with patch.object(gateway,'image_references',return_value={'vpn':'synthetic-image'}), \
+             patch.object(gateway.socket,'getaddrinfo',return_value=[(None,None,None,None,('1.1.1.1',443))]), \
+             patch.object(gateway,'docker',return_value=subprocess.CompletedProcess([],28,'','')) as docker:
+            evidence=gateway.docker_proxy_outer_test('synthetic-socks', 'synthetic-inspector')
+        self.assertFalse(evidence['outer_control_succeeded'])
+        self.assertFalse(evidence['firewall_reject_observed'])
+        self.assertEqual(docker.call_count,1)
+
+    def test_docker_probe_requires_counter_and_removes_route_after_exception(self):
+        for interrupt in (False, True):
+            events=[];counter=iter(['[3:180] -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited',
+                                    '[4:240] -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited'])
+            def docker(*args,**kwargs):
+                events.append(args)
+                if args[0]=='exec' and 'curl' in args:
+                    if interrupt:raise subprocess.TimeoutExpired(['curl'],15)
+                    return subprocess.CompletedProcess([],7,'','')
+                if '/usr/sbin/iptables-save' in args:return subprocess.CompletedProcess([],0,next(counter),'')
+                if '-j' in args:return subprocess.CompletedProcess([],0,'[{"gateway":"172.19.0.1","dev":"eth0"}]','')
+                return subprocess.CompletedProcess([],0,'','')
+            with self.subTest(interrupt=interrupt), patch.object(gateway,'image_references',return_value={'vpn':'synthetic'}), \
+                 patch.object(gateway.socket,'getaddrinfo',return_value=[(None,None,None,None,('1.1.1.1',443))]), \
+                 patch.object(gateway,'docker',side_effect=docker):
+                evidence=gateway.docker_proxy_outer_test('synthetic-socks', 'synthetic-inspector')
+            self.assertTrue(evidence['probe_route_removed'])
+            self.assertIn('del',events[-1])
+            self.assertEqual(evidence['firewall_reject_observed'],not interrupt)
+
+
+class FailurePhaseTests(unittest.TestCase):
+    def test_docker_measures_firewall_before_stopping_namespace_owner(self):
+        events=[]
+        proof=dict(outer_control_succeeded=True,proxy_outer_blocked=True,
+                   firewall_reject_observed=True,probe_route_removed=True)
+        def docker(*args, **kwargs):
+            if args[0]=='run':return subprocess.CompletedProcess([],0,'a'*64,'')
+            if args[0]=='inspect':return subprocess.CompletedProcess([],0,'false','')
+            if args[0]=='exec' and 'python3' in args:events.append('stop')
+            return subprocess.CompletedProcess([],1 if 'link' in args else 0,'','')
+        def firewall(*args):events.append('firewall');return proof
+        with patch.object(gateway,'container_id',side_effect=lambda x:x), \
+             patch.object(gateway,'ready',return_value=True), \
+             patch.object(gateway,'read_json',return_value={'dns':['192.0.2.53']}), \
+             patch.object(gateway,'socks_dns_query',side_effect=[True,False]), \
+             patch.object(gateway,'image_references',return_value={'vpn':'synthetic'}), \
+             patch.object(gateway,'docker_proxy_outer_test',side_effect=firewall), \
+             patch.object(gateway,'docker',side_effect=docker) as execute, \
+             patch.object(gateway,'public_ip',return_value='203.0.113.1'), \
+             patch.object(gateway.time,'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            result=gateway.failure_test('docker')
+        self.assertEqual(events,['firewall','stop'])
+        self.assertEqual(result['docker_firewall_probe_phase'],'before_tunnel_loss')
+        self.assertTrue(gateway.failure_evidence_passed(result,'docker'))
+        execute.assert_any_call('rm','-f','a'*64,check=False,timeout=20)

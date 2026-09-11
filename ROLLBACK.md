@@ -146,3 +146,39 @@ change the backend or reinstall an already provisioned WSL distro. Never substit
 a guessed or unrelated directory. New ordinary-terminal installations need no such
 legacy-location option. PATH journal and location records are private and excluded
 from the source package. Existing shells must be reopened after registration/removal.
+
+
+## macOS Docker runtime migration (2026.09.11.1)
+
+Run `python3 install.py --wizard --update --migrate-docker` from the verified
+source checkout. It supports reviewed versions 2026.08.30.1, 2026.09.01.2,
+2026.09.10.1 and 2026.09.11.1 on macOS with the Docker backend. This is an explicit
+runtime migration, separate from the host-only updater. New Docker images receive
+content-derived `:rev-...` tags and source-hash labels; existing `:local` tags are
+not overwritten. Image compile/binary checks precede the stop confirmation.
+
+Application files, owned launchers, the installation marker and previous running
+image IDs are saved in a private `backups/app-update-*` directory. Private settings,
+profile copies and the Git rollback registry have preservation copies there;
+credentials and runtime state are excluded. Browser profiles and external command
+symlinks are preserved in place. Retain the old Docker images until acceptance;
+do not run Docker image pruning during the rollback window.
+
+A failed file write or launcher check restores application files automatically.
+An interrupted write leaves `update-pending.json`: rerun the verified wizard to
+recover before starting. To undo a completed migration, including after failed
+network acceptance:
+
+```sh
+python3 install.py --wizard --rollback-docker
+```
+
+Rollback stops the gateway and restores only its recorded application/marker and
+launchers. It does not overwrite later private settings or Git edits and never
+restores credentials. Start again with locally entered credentials. Both migration
+and rollback leave the gateway stopped. A failed stop aborts the migration; its
+error separately reports credential cleanup and any unverified container lifetime.
+
+macOS troubleshooting commands use `python3 install.py --wizard`, not `setup.cmd`.
+The ordinary host-only updater remains guarded against changed Linux assets;
+use the explicit Docker migration when the runtime changed.

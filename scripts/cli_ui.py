@@ -5,7 +5,7 @@ import platform
 import subprocess
 import time
 
-from product import ProductError, error_text
+from product import ProductError, error_text, platform_instruction
 
 
 def record(gateway, state, code=None):
@@ -36,35 +36,18 @@ def report(gateway, explicit=None, diagnose=False):
         return result
     result['backend'] = backend
     check('configuration', 'pass', 'Deployment configuration accepted.')
-    data, available = {}, False
-    try:
-        if backend == 'wsl':
-            names = gateway.wsl_names()
-            available = gateway.WSL_DISTRO in names and gateway.wsl_owned()
-            if available:
-                data = gateway.wsl_status_data()
-            check('networking_mode', 'info', gateway.wsl_backend.networking_mode(gateway.Path.home()/'.wslconfig'))
-        else:
-            engine = gateway.docker('info', '--format', '{{.OSType}}', check=False, timeout=12)
-            available = engine.returncode == 0 and engine.stdout.strip().lower() == 'linux'
-            if available:
-                data = gateway.read_json(gateway.STATE/'status.json')
-                cid = gateway.container_id('vpn')
-                tun = gateway.docker('exec', cid, 'test', '-d', '/sys/class/net/tun0', check=False, timeout=10) if cid else None
-                data['tun_exists'] = bool(tun and tun.returncode == 0)
-    except (OSError, ValueError, subprocess.TimeoutExpired, gateway.GatewayError):
-        available = False
+    if backend == 'wsl':
+        check('networking_mode', 'info', gateway.wsl_backend.networking_mode(gateway.Path.home()/'.wslconfig'))
+    live = gateway.connection_state(backend)
+    data, available = live['data'], live['available']
+    data = dict(data, tun_exists=live['tun_exists'])
     check('backend', 'pass' if available else 'fail', 'Selected backend available.' if available else 'Selected backend unavailable or not owned.')
-    socks = False
-    listener = not gateway.host.IS_WINDOWS
-    if available:
-        try:
-            socks = gateway.socks_available()
-            if gateway.host.IS_WINDOWS:
-                listener = gateway.listener_result().get('loopback_only') is True
-        except (OSError, subprocess.TimeoutExpired, gateway.GatewayError):
-            pass
-    connected = available and data.get('ready') is True and data.get('tun_exists') is True and socks and listener
+    socks, listener, connected = live['socks'], live['loopback_only'], live['ready']
+    check('listener', 'pass' if listener is True else 'fail' if listener is False else 'not_checked',
+          'Only IPv4 loopback is listening.' if listener is True else
+          'Listener is absent or not restricted to IPv4 loopback.' if listener is False else 'Listener inspection unavailable.')
+    check('health', 'pass' if live['healthy'] else 'not_checked',
+          'Live tunnel health verified.' if live['healthy'] else 'Live tunnel health not confirmed.')
     check('tunnel', 'pass' if data.get('tun_exists') else 'not_checked', 'tun0 present.' if data.get('tun_exists') else 'No live tun0 confirmed.')
     check('socks', 'pass' if socks and listener else 'not_checked', 'Loopback SOCKS handshake passed.' if socks and listener else 'Loopback SOCKS is not ready.')
     check('corporate_dns', 'pass' if data.get('dns_pushed') else 'not_checked',
@@ -74,7 +57,7 @@ def report(gateway, explicit=None, diagnose=False):
     connecting = data.get('openvpn_running') and not data.get('initialization_completed')
     if state.get('state') == 'connecting' and gateway.host.lifecycle_busy(gateway.ROOT/'.lock'):
         connecting = True
-    result['state'] = ('ready' if connected else 'error' if not available or data.get('hook_error') else
+    result['state'] = ('ready' if connected else 'error' if not available or data.get('hook_error') or (data.get('ready') and not connected) else
                        'connecting' if connecting else
                        'blocked' if state.get('state') == 'blocked' else 'error' if state.get('state') == 'error' else 'stopped')
     result['next_action'] = {'ready': 'vpn-gateway browser', 'stopped': 'vpn-gateway start',
@@ -84,6 +67,16 @@ def report(gateway, explicit=None, diagnose=False):
                              tun_exists=bool(data.get('tun_exists')), socks_handshake=socks,
                              loopback_only=listener, pushed_dns=bool(data.get('dns_pushed')),
                              service_manager=('systemd' if data.get('systemd') else 'fallback') if backend == 'wsl' else 'containers')
+    selected_transport = gateway.RUNTIME/'selected-transport'
+    try:
+        transport = selected_transport.read_text().strip()
+        if transport in cfg.get('transports', {}):
+            result['details']['transport'] = transport
+    except OSError:
+        pass
+    connected_at = data.get('connected_at')
+    if connected and isinstance(connected_at, (int, float)):
+        result['details']['connected_seconds'] = max(0, int(time.time() - connected_at))
     if diagnose:
         check('platform', 'info', platform.system() + ' ' + platform.release() + ' ' + platform.machine())
         try:
@@ -102,6 +95,7 @@ def report(gateway, explicit=None, diagnose=False):
 
 
 def render(result, *, structured=False, verbose=False):
+    result = dict(result, next_action=platform_instruction(result['next_action']))
     if structured:
         print(json.dumps(result, ensure_ascii=True))
     else:

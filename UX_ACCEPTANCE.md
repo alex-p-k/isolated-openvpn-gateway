@@ -4,6 +4,43 @@ The CLI product layer is separate from previously recorded WSL gateway acceptanc
 New setup/update/Firefox behavior needs its own real acceptance. Unit tests are not
 a Windows Home first-use study or proof of browser DNS isolation.
 
+## macOS implementation and live gateway validation — 2026-09-11
+
+Host: macOS 15.6.1 (24G90), arm64; Python 3.11.9; Chrome 152.0.7977.83.
+Version: 2026.09.11.1, migrated from the installed 2026.08.30.1 Docker deployment.
+
+- Regression suite: 208 tests, 197 passed and 11 platform-specific skips on macOS,
+  using the ordinary unittest command and default macOS temporary directory.
+- Live migration: PASS. Versioned images built and checked before stopping; private
+  backup mode checks passed, no auth file was backed up, original app image IDs
+  retained, and installed package hashes matched the verified source.
+- Live UDP connection: PASS. Initialization, owned containers, tun0 address and
+  policy health, actual macOS IPv4-loopback listener and SOCKS handshake verified.
+- Corporate DNS payload, corporate HTTPS connection and repository-local read-only
+  Git remote check: PASS. No repository network settings were rewritten by migration.
+- Independent firewall challenge: PASS. A direct outer Docker HTTPS control worked;
+  a temporary destination route in the gateway namespace forced proxy UID 10000
+  toward eth0, its request failed, and the OUTPUT REJECT packet counter increased.
+  The exact probe route was removed. This was measured BEFORE tunnel loss because
+  Docker tears down the VPN container's outer networking when it exits.
+- Tunnel-loss test: PASS. After successful SOCKS DNS payload, only OpenVPN was
+  terminated, tun0 disappeared and new SOCKS requests failed. A fresh outer-path
+  preflight and UDP reconnect restored readiness and corporate DNS payload.
+- Host DNS/default/static/public routes, outer egress and global Git configuration:
+  PASS against the fresh connection baseline, including across the loss/restoration test.
+- Chrome synthetic socket probe: PASS (direct positive control, SOCKS DOMAIN payload,
+  rejection, browser-reported errors and no direct control-target hits). Dedicated
+  corporate launcher and saved GitLab landing-page preference exercised separately.
+- Packet-level local DNS observer: NOT RUN. macOS refused the filtered capture
+  interface with Operation not permitted. Continuous browser request observation
+  across real tunnel loss: NOT RUN. These are not inferred from the separate tests.
+- Fresh Windows/WSL acceptance of this revision: NOT RUN on this Mac. Existing WSL
+  implementation and platform-specific tests remain; mocks are not live acceptance.
+
+The first diagnostic prototype could not measure the firewall after owner teardown;
+it reported failure rather than passing. The final probe records its actual phase
+and requires observed counters; no hardcoded Docker firewall PASS remains.
+
 ## Implementation validation — 2026-09-10
 
 Machine: Windows Home Single Language (`CoreSingleLanguage`), 25H2,

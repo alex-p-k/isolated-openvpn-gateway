@@ -26,7 +26,7 @@ PACKAGE_FILES = (
     'tools/windows_acceptance.ps1', 'tests/test_wsl_process.py',
     'setup.cmd', 'scripts/product.py', 'scripts/profile_import.py',
     'scripts/path_integration.py', 'scripts/setup_wizard.py', 'scripts/cli_ui.py',
-    'scripts/git_integration.py', 'tests/test_product.py', 'UX_ACCEPTANCE.md', 'tools/browser_probe.py', 'HISTORY.md',
+    'scripts/git_integration.py', 'scripts/docker_migration.py', 'tests/test_product.py', 'UX_ACCEPTANCE.md', 'tools/browser_probe.py', 'HISTORY.md',
 )
 INSTALL_FILES = tuple(x for x in PACKAGE_FILES if x not in (
     'gateway.example.toml', 'tests/test_install.py', 'tools/build_release.py',

@@ -37,9 +37,15 @@ def read_object(path):
     return data
 
 
+def platform_instruction(text):
+    if sys.platform == 'darwin':
+        return text.replace('.\\setup.cmd', 'python3 install.py --wizard')
+    return text
+
+
 def error_text(exc):
     if isinstance(exc, ProductError):
-        return f'ERROR [{exc.code}]: {exc}\nNext: {exc.next_action}'
+        return platform_instruction(f'ERROR [{exc.code}]: {exc}\nNext: {exc.next_action}')
     # OSError/TimeoutExpired and legacy subprocess errors may contain private
     # URLs, arguments, stdout or stderr. Do not pass their text to the terminal.
     reason = str(exc).lower()

@@ -266,3 +266,51 @@ class GitTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DockerMigrationTests(unittest.TestCase):
+    def test_transaction_restores_app_launcher_marker_after_failed_smoke(self):
+        import json
+        import docker_migration
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); (root/'config').mkdir(); (root/'bin').mkdir()
+            (root/'config'/'profile.ovpn').write_text('PRIVATE PROFILE')
+            (root/'settings.json').write_text('PRIVATE SETTINGS')
+            (root/'git-changes.json').write_text('[]')
+            (root/'runtime').mkdir(); (root/'runtime'/'auth').write_text('DO NOT BACK UP')
+            marker={'project':'isolated-openvpn-gateway','kit_version':'2026.08.30.1'}
+            (root/'installation.json').write_text(json.dumps(marker))
+            (root/'VERSION').write_text('old')
+            (root/'bin'/'vpn-gateway').write_text('old launcher')
+            changes={'VERSION':b'new','added.py':b'new file','bin/vpn-gateway':b'new launcher'}
+            fake=SimpleNamespace(INSTALL_FILES=['VERSION','added.py'],digest=installer.digest)
+            with patch.object(docker_migration,'application_changes',return_value=changes), \
+                 patch.object(docker_migration.subprocess,'run',return_value=SimpleNamespace(returncode=1)):
+                with self.assertRaises(Exception):
+                    docker_migration.apply_files(ROOT,root,fake,marker,{'vpn':'new','socks':'new'}, {'vpn':'old-image-id'})
+            self.assertEqual((root/'VERSION').read_text(),'old')
+            self.assertEqual((root/'bin'/'vpn-gateway').read_text(),'old launcher')
+            self.assertFalse((root/'added.py').exists())
+            self.assertFalse((root/'update-pending.json').exists())
+            self.assertEqual(json.loads((root/'installation.json').read_text()),marker)
+            self.assertEqual((root/'settings.json').read_text(),'PRIVATE SETTINGS')
+            self.assertFalse(any(p.name=='auth' for p in (root/'backups').rglob('*')))
+            self.assertEqual((root/'runtime'/'auth').read_text(),'DO NOT BACK UP')
+
+    def test_interrupted_migration_recovers_with_existing_update_journal(self):
+        import json
+        import setup_wizard
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve(); backup=root/'backups'/'app-update-123'
+            (backup/'bin').mkdir(parents=True); (root/'bin').mkdir()
+            (backup/'bin'/'vpn-gateway').write_text('old launcher')
+            (backup/'installation.json').write_text('{"kit_version":"2026.08.30.1"}')
+            (backup/'inventory.json').write_text('{"bin/vpn-gateway":true,"added.py":false}')
+            (root/'bin'/'vpn-gateway').write_text('new launcher'); (root/'added.py').write_text('partial')
+            (root/'update-pending.json').write_text(json.dumps({'backup':str(backup),'files':['bin/vpn-gateway','added.py']}))
+            setup_wizard.recover_update(root, SimpleNamespace(INSTALL_FILES=['added.py']))
+            self.assertEqual((root/'bin'/'vpn-gateway').read_text(),'old launcher')
+            self.assertFalse((root/'added.py').exists())
+            self.assertFalse((root/'update-pending.json').exists())

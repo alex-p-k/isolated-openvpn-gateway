@@ -367,7 +367,7 @@ class WslGatewayTests(unittest.TestCase):
             with patch.object(gateway, 'AUTH', auth), \
                  patch.object(gateway, 'wsl_names', return_value=[wsl_backend.DISTRO]), \
                  patch.object(gateway, 'wsl_owned', return_value=True), \
-                 patch.object(gateway, 'wsl') as invoke:
+                 patch.object(gateway, 'wsl', return_value=SimpleNamespace(returncode=0)) as invoke:
                 gateway.cleanup_auth('wsl')
             self.assertFalse(auth.exists())
             invoke.assert_called_once_with('/usr/bin/rm','-f','/run/isolated-openvpn-gateway/auth',

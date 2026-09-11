@@ -1,6 +1,6 @@
 # Isolated OpenVPN Gateway
 
-Isolated OpenVPN Gateway is a local OpenVPN-to-SOCKS5 gateway for selected macOS and Windows applications. Corporate OpenVPN runs only inside an isolated Linux environment; it is never installed or started on the Windows host.
+Isolated OpenVPN Gateway is a local OpenVPN-to-SOCKS5 gateway for selected macOS and Windows applications. Corporate OpenVPN runs only inside an isolated Linux environment; it is never installed or started on the macOS or Windows host.
 
 Windows has two independent backends:
 
@@ -62,7 +62,9 @@ The primary documentation is maintained in English.
 
 `start` without `--open-browser` stays terminal-only. Repeated setup preserves
 the selected backend and private deployment. To update the installed CLI from a
-new verified checkout, use `.\setup.cmd --update`; no automatic update/download
+new verified checkout, use `.\setup.cmd --update` on Windows or
+`python3 install.py --wizard --update` on macOS (for changed Docker runtime or
+the older Mac installation, add `--migrate-docker`); no automatic update/download
 of application code is performed. Firefox is explicit opt-in and experimental
 until its real network acceptance is complete; Chrome remains supported.
 

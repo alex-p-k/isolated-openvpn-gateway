@@ -1,5 +1,52 @@
 # Developer quickstart
 
+Choose your host platform below. Both use the same daily commands; Windows can use
+WSL without Docker, while macOS uses Docker Desktop.
+
+## macOS — install and daily use
+
+Prerequisites: macOS arm64/x86_64, Python 3.11+, Docker Desktop running Linux
+containers, your outer VPN, and an IT-issued profile. From this source checkout:
+
+```sh
+python3 install.py --wizard --backend docker
+```
+
+The wizard imports a single `.ovpn` or an IT TOML kit, prepares the Docker images,
+and asks for a corporate browser URL and optional repository-local Git setup.
+If `vpn-gateway` is not found, add this to your shell configuration once, then
+open a new terminal (or use `~/.local/bin/vpn-gateway` directly):
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Daily use:
+
+```sh
+vpn-gateway start --open-browser
+vpn-gateway status --verbose
+vpn-gateway git check /path/to/repository --remote
+vpn-gateway stop
+```
+
+`vpn-gateway doctor --json` gives a sanitized report. A successful SOCKS greeting
+alone does not count as readiness: live owned containers, tunnel health and
+loopback listener evidence are required. No password is saved between sessions.
+
+For the older macOS `2026.08.30.1` installation, run from a verified new checkout:
+
+```sh
+python3 install.py --wizard --update --migrate-docker
+```
+
+This stages new images before asking to stop the gateway, then backs up and
+updates the application. It preserves aliases, corporate profiles, browser data
+and repository-local Git settings. Restart with fresh credentials afterward.
+The migration and rollback procedure is in [ROLLBACK.md](ROLLBACK.md).
+
+## Windows — first installation
+
 You need Windows 11 Home or Pro, Python 3.11+, and an IT-issued `.ovpn` profile
 or a kit containing `gateway.toml` and its profiles. The WSL backend does not
 require Docker. Corporate OpenVPN runs only inside the isolated Linux environment.

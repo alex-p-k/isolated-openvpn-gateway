@@ -97,9 +97,23 @@ def run(args, *, check=True, timeout=40, capture=True, env=None, **kwargs):
 def docker(*args, **kwargs):
     return run([DOCKER, '--context', 'desktop-linux', *args], **kwargs)
 
+def image_references():
+    values = read_json(ROOT/'installation.json').get('docker_images')
+    if values is None:
+        return {'vpn': IMAGE, 'socks': SOCKS_IMAGE}
+    if (not isinstance(values, dict) or set(values) != {'vpn', 'socks'} or
+            any(not re.fullmatch(r'isolated-openvpn-gateway-' + name + r':rev-[a-f0-9]{16}', value)
+                for name, value in values.items() if isinstance(value, str)) or
+            any(not isinstance(value, str) for value in values.values())):
+        raise GatewayError('Invalid managed Docker image inventory.')
+    return values
+
+
 def compose(*args, **kwargs):
     cfg = configuration()
-    env = dict(ENV, GATEWAY_SOCKS_PORT=str(cfg['socks_port']))
+    refs = image_references()
+    env = dict(ENV, GATEWAY_SOCKS_PORT=str(cfg['socks_port']),
+               GATEWAY_VPN_IMAGE=refs['vpn'], GATEWAY_SOCKS_IMAGE=refs['socks'])
     return run([DOCKER, '--context', 'desktop-linux', 'compose', '--project-name', PROJECT,
                 '--project-directory', ROOT, '-f', ROOT/'compose.yaml', *args], env=env, **kwargs)
 
@@ -404,7 +418,7 @@ def engine():
         raise GatewayError('Docker backend requires Docker Desktop Linux containers; Windows containers are unsupported.')
 
 def images():
-    for image in (IMAGE, SOCKS_IMAGE):
+    for image in image_references().values():
         if docker('image','inspect', image, check=False).returncode:
             print('Building private gateway images (no configuration or credentials in build context).',flush=True)
             compose('build', timeout=600, capture=False)
@@ -565,14 +579,14 @@ def docker_preflight():
     engine(); images()
     cfg = configuration()
     tun = docker('run','--rm','--cap-drop','ALL','--device','/dev/net/tun:/dev/net/tun',
-                 '--security-opt','no-new-privileges','--entrypoint','test',IMAGE,'-c','/dev/net/tun',
+                 '--security-opt','no-new-privileges','--entrypoint','test',image_references()['vpn'],'-c','/dev/net/tun',
                  check=False,timeout=20)
     if tun.returncode:
         raise GatewayError('Docker Desktop cannot expose /dev/net/tun to a Linux container. Inner OpenVPN was not started.')
     before = network_snapshot()
     verify_outer_host(before, cfg)
     result = docker('run','--rm','--cap-drop','ALL','--read-only','--security-opt','no-new-privileges',
-                    '--entrypoint','curl',IMAGE,'-4','--noproxy','*','-fsS','--max-time','15',IP_URL, timeout=25)
+                    '--entrypoint','curl',image_references()['vpn'],'-4','--noproxy','*','-fsS','--max-time','15',IP_URL, timeout=25)
     container_ip = result.stdout.strip()
     if not before['public_ip'] or container_ip != before['public_ip']:
         raise GatewayError('Outer path check failed: host/container egress differs or is unavailable. Inner VPN was not started.')
@@ -644,8 +658,28 @@ def listener_result():
     cfg = configuration()
     if host.IS_WINDOWS:
         return wsl_backend.listener_validation(windows_listener_records(cfg['socks_port']), cfg['socks_port'])
-    return {'listener_present': socks_available(), 'loopback_only': True,
-            'ipv4_wildcard_absent': True, 'ipv6_wildcard_absent': True, 'addresses':['127.0.0.1']}
+    unknown = {'listener_present': None, 'loopback_only': None,
+               'ipv4_wildcard_absent': None, 'ipv6_wildcard_absent': None, 'addresses': []}
+    try:
+        result = run(['/usr/sbin/lsof', '-nP', '-a', '-iTCP:' + str(cfg['socks_port']),
+                      '-sTCP:LISTEN', '-Fpn'], check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return unknown
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        return unknown
+    records = []
+    for line in result.stdout.splitlines():
+        if not line.startswith('n'):
+            continue
+        address, separator, port = line[1:].rpartition(':')
+        if not separator or port != str(cfg['socks_port']):
+            return unknown
+        address = address.strip('[]')
+        records.append({'LocalAddress': '0.0.0.0' if address == '*' else address,
+                        'LocalPort': cfg['socks_port']})
+    if result.returncode == 0 and not records:
+        return unknown
+    return wsl_backend.listener_validation(records, cfg['socks_port'])
 
 def listener_pid(record):
     try:
@@ -695,10 +729,68 @@ def start_forwarder():
     stop_forwarder()
     raise GatewayError('Windows loopback-only SOCKS forwarder did not start.')
 
-def ready(backend='docker'):
+def connection_state(backend='docker'):
+    """Read live ownership, tunnel health and listener evidence for every client."""
     selected = backend_name(backend)
-    state = wsl_status_data() if selected == 'wsl' else read_json(STATE/'status.json')
-    return bool(state.get('ready')) and socks_available()
+    evidence = dict(available=False, data={}, tun_exists=False, healthy=False,
+                    socks=False, loopback_only=None, ready=False)
+    try:
+        if selected == 'wsl':
+            evidence['available'] = WSL_DISTRO in wsl_names() and wsl_owned()
+            if not evidence['available']:
+                return evidence
+            data = wsl_status_data()
+            evidence['data'] = data
+            address = wsl_network('/sbin/ip', '-4', '-o', 'addr', 'show', 'dev', 'tun0', check=False, timeout=10)
+            route = wsl_network('/sbin/ip', '-4', 'route', 'get', '1.1.1.1', 'uid', '10000', check=False, timeout=10)
+            evidence['tun_exists'] = address.returncode == 0 and 'inet ' in address.stdout
+            evidence['healthy'] = (data.get('owned') is True and data.get('openvpn_running') is True
+                                   and data.get('routes_ready') is True and not data.get('hook_error')
+                                   and route.returncode == 0 and 'dev tun0' in route.stdout)
+        else:
+            engine_result = docker('info', '--format', '{{.OSType}}', check=False, timeout=12)
+            evidence['available'] = engine_result.returncode == 0 and engine_result.stdout.strip() == 'linux'
+            if not evidence['available']:
+                return evidence
+            vpn_id, socks_id = container_id('vpn'), container_id('socks')
+            if not vpn_id or not socks_id:
+                return evidence
+            details = json.loads(docker('inspect', vpn_id, socks_id, timeout=12).stdout)
+            if len(details) != 2:
+                return evidence
+            for item, service in zip(details, ('vpn', 'socks')):
+                labels = item.get('Config', {}).get('Labels', {})
+                directory = labels.get('com.docker.compose.project.working_dir', '')
+                if (labels.get('com.docker.compose.project') != PROJECT
+                        or labels.get('com.docker.compose.service') != service
+                        or Path(directory).resolve() != ROOT.resolve()
+                        or item.get('State', {}).get('Running') is not True):
+                    return evidence
+            if details[1]['HostConfig'].get('NetworkMode') != 'container:' + details[0]['Id']:
+                return evidence
+            cfg = configuration()
+            bindings = details[0]['HostConfig'].get('PortBindings', {}).get('1080/tcp', [])
+            if bindings != [{'HostIp': cfg['socks_host'], 'HostPort': str(cfg['socks_port'])}]:
+                return evidence
+            evidence['data'] = read_json(STATE/'status.json')
+            address = docker('exec', vpn_id, 'ip', '-4', '-o', 'addr', 'show', 'dev', 'tun0', check=False, timeout=10)
+            evidence['tun_exists'] = address.returncode == 0 and 'inet ' in address.stdout
+            evidence['healthy'] = docker('exec', vpn_id, 'python3', '/opt/gateway/vpn.py', 'health',
+                                         check=False, timeout=10).returncode == 0
+        listener = listener_result()
+        evidence['loopback_only'] = listener.get('loopback_only')
+        evidence['socks'] = socks_available() if listener.get('listener_present') is True else False
+        data = evidence['data']
+        evidence['ready'] = bool(data.get('ready') is True and data.get('initialization_completed') is True
+                                 and evidence['tun_exists'] and evidence['healthy'] and evidence['socks']
+                                 and evidence['loopback_only'] is True)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, GatewayError):
+        evidence['ready'] = False
+    return evidence
+
+
+def ready(backend='docker'):
+    return connection_state(backend)['ready']
 
 def cleanup_auth(backend='docker'):
     # SSD/APFS cannot promise forensic secure erasure; permissions and short
@@ -708,9 +800,11 @@ def cleanup_auth(backend='docker'):
     if backend == 'wsl' and WSL_DISTRO in wsl_names():
         if not wsl_owned():
             raise GatewayError('Refusing credential cleanup in an unowned WSL distro.')
-        wsl('/usr/bin/rm', '-f', '/run/isolated-openvpn-gateway/auth', check=False, timeout=20)
+        result = wsl('/usr/bin/rm', '-f', '/run/isolated-openvpn-gateway/auth', check=False, timeout=20)
+        if result.returncode:
+            raise GatewayError('Managed WSL credential removal failed.')
 
-def stop_internal(keep_auth=False, backend='docker'):
+def _stop_services(keep_auth=False, backend='docker'):
     selected = backend_name(backend)
     if selected == 'wsl':
         stop_forwarder()
@@ -723,16 +817,35 @@ def stop_internal(keep_auth=False, backend='docker'):
                             check=False, timeout=20).returncode == 0
             if available:
                 result = wsl_manager(action, check=False, timeout=35)
-        if not keep_auth:
-            cleanup_auth('wsl')
         if result is not None and result.returncode:
             raise GatewayError('Managed WSL services could not be stopped; credentials cleanup was still attempted.')
         return
     result = compose('down','--timeout','8','--remove-orphans',check=False,timeout=35)
-    if not keep_auth:
-        cleanup_auth('docker')
     if result.returncode:
-        raise GatewayError('Docker could not remove gateway containers. Credentials were removed unless this is a controlled transport comparison.')
+        raise GatewayError('Docker could not remove gateway containers.')
+
+def stop_internal(keep_auth=False, backend='docker'):
+    selected = backend_name(backend)
+    stop_error = cleanup_error = None
+    try:
+        _stop_services(keep_auth=keep_auth, backend=selected)
+    except BaseException as exc:
+        stop_error = exc
+    finally:
+        if not keep_auth:
+            try:
+                cleanup_auth(selected)
+            except BaseException as exc:
+                cleanup_error = exc
+    if stop_error or cleanup_error:
+        # Never render child exception text or claim remote erasure on timeout.
+        status = 'failed' if stop_error else 'completed'
+        cleanup = ('not requested (controlled comparison)' if keep_auth else
+                   'failed or unverified' if cleanup_error else
+                   'host auth path removed; container credential lifetime unverified' if stop_error and selected == 'docker' else 'completed')
+        raise ProductError('STOP_INCOMPLETE', 'Service stop: ' + status + '; credential cleanup: ' + cleanup + '.',
+                           'Check backend availability and retry vpn-gateway stop.') from None
+
 
 def prompt_credentials(backend='docker'):
     cleanup_auth(backend)
@@ -884,7 +997,7 @@ def start_transport(transport, timeout=100, backend='docker'):
             if data.get('ready') and data.get('tun_exists'):
                 start_forwarder()
                 for _ in range(24):
-                    if socks_available() and listener_result()['loopback_only']:
+                    if ready('wsl'):
                         print('Connected: Initialization Sequence Completed; WSL tun0 verified; '
                               'Windows loopback-only SOCKS5 handshake passed.', flush=True)
                         return True
@@ -909,7 +1022,7 @@ def start_transport(transport, timeout=100, backend='docker'):
             if cid and docker('exec',cid,'python3','/opt/gateway/vpn.py','health',check=False).returncode == 0:
                 compose('up','-d','--no-build','socks',timeout=35)
                 for _ in range(20):
-                    if socks_available():
+                    if ready('docker'):
                         print('Connected: Initialization Sequence Completed; tun0 verified; SOCKS5 handshake passed.',flush=True)
                         return True
                     time.sleep(0.5)
@@ -1085,6 +1198,55 @@ def validation(target=None, backend='docker'):
     print(json.dumps(result,indent=2))
     return result
 
+def docker_proxy_outer_test(socks_id, inspector_id):
+    """Prove a firewall rejection separately from an unreachable policy route."""
+    evidence = dict(outer_control_succeeded=False, proxy_outer_blocked=False,
+                    firewall_reject_observed=False, probe_route_removed=False)
+    address = None
+    route_added = False
+    image = image_references()['vpn']
+    def inspect_namespace(executable, *args, **kwargs):
+        return docker('exec', inspector_id, executable, *args, timeout=20, **kwargs)
+    def reject_count():
+        output = inspect_namespace('/usr/sbin/iptables-save', '-c').stdout
+        counts = re.findall(r'^\[(\d+):\d+\] -A OUTPUT .*?-j REJECT(?: |$)', output, re.M)
+        return sum(map(int, counts)) if counts else None
+    try:
+        address = socket.getaddrinfo('checkip.amazonaws.com', 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        if not ipaddress.IPv4Address(address).is_global:
+            return evidence
+        arguments = ['-4', '--noproxy', '*', '--fail', '--silent', '--show-error',
+                     '--resolve', 'checkip.amazonaws.com:443:' + address,
+                     '--connect-timeout', '4', '--max-time', '8', IP_URL]
+        control = docker('run', '--rm', '--cap-drop', 'ALL', '--read-only', '--entrypoint', 'curl',
+                         image, *arguments, check=False, timeout=20)
+        evidence['outer_control_succeeded'] = control.returncode == 0
+        if not evidence['outer_control_succeeded']:
+            return evidence
+        routes = json.loads(inspect_namespace('/sbin/ip', '-j', '-4', 'route', 'show', 'default').stdout)
+        outer = next(row['gateway'] for row in routes if row.get('dev') == 'eth0')
+        # add (not replace) refuses an existing route; delete the exact probe in finally.
+        inspect_namespace('/sbin/ip', 'route', 'add', address + '/32', 'via', outer,
+                          'dev', 'eth0', 'table', '100')
+        route_added = True
+        before = reject_count()
+        probe = docker('exec', '--user', '10000:10000', socks_id, 'curl', '--interface', 'eth0',
+                       *arguments, check=False, timeout=15)
+        after = reject_count()
+        evidence['proxy_outer_blocked'] = probe.returncode != 0
+        evidence['firewall_reject_observed'] = before is not None and after is not None and after > before
+    except (OSError, ValueError, StopIteration, GatewayError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        if route_added:
+            try:
+                result = inspect_namespace('/sbin/ip', 'route', 'del', address + '/32', 'table', '100', check=False)
+                evidence['probe_route_removed'] = result.returncode == 0
+            except (OSError, GatewayError, subprocess.TimeoutExpired):
+                pass
+    return evidence
+
+
 def failure_test(backend='docker'):
     selected = backend_name(backend)
     cid=container_id('vpn') if selected == 'docker' else None
@@ -1102,7 +1264,26 @@ def failure_test(backend='docker'):
         if not canary():
             raise GatewayError('Failure test aborted: a successful SOCKS request is required as a positive control.')
     result = {}
+    inspector_id = None
     try:
+        if selected == 'docker':
+            # Docker removes the owner's eth0 when the VPN container exits.
+            # Measure actual firewall rejection while eth0 exists, independently
+            # of the subsequent tun-loss / SOCKS-failure check.
+            inspector_id = docker('run', '-d', '--rm', '--network', 'container:' + cid,
+                                  '--cap-drop', 'ALL', '--cap-add', 'NET_ADMIN', '--read-only',
+                                  '--security-opt', 'no-new-privileges', '--entrypoint', '/bin/sleep',
+                                  image_references()['vpn'], '180', timeout=20).stdout.strip()
+            if not re.fullmatch(r'[a-f0-9]{64}', inspector_id):
+                raise GatewayError('Diagnostic namespace holder could not be verified.')
+            socks = container_id('socks')
+            evidence = docker_proxy_outer_test(socks, inspector_id) if socks else {}
+            result['docker_firewall_probe'] = evidence
+            result['docker_firewall_probe_phase'] = 'before_tunnel_loss'
+            if not all(evidence.get(key) is True for key in (
+                    'outer_control_succeeded', 'proxy_outer_blocked', 'firewall_reject_observed', 'probe_route_removed')):
+                raise GatewayError('Independent Docker firewall control did not pass; tunnel-loss test was not started.')
+
         if selected == 'wsl':
             wsl_manager('stop-vpn', timeout=25)
         else:
@@ -1128,11 +1309,15 @@ def failure_test(backend='docker'):
             stopped=docker('inspect','--format','{{.State.Running}}',cid,check=False).stdout.strip() == 'false'
             socks=container_id('socks')
             tun_absent=bool(socks) and docker('exec',socks,'ip','link','show','tun0',check=False).returncode != 0
-            firewall_blocked=True
+            evidence = result['docker_firewall_probe']
+            firewall_blocked = all(evidence.get(key) is True for key in (
+                'outer_control_succeeded', 'proxy_outer_blocked', 'firewall_reject_observed', 'probe_route_removed'))
         result.update(openvpn_terminated=stopped, tun0_absent=tun_absent,
                       proxy_request_verified_before_stop=True, socks_after_vpn_stop_blocked=blocked,
                       firewall_forced_outer_blocked=firewall_blocked, host_still_online=bool(outer))
     finally:
+        if inspector_id and re.fullmatch(r'[a-f0-9]{64}', inspector_id):
+            docker('rm', '-f', inspector_id, check=False, timeout=20)
         if selected == 'wsl':
             result['state_restored'] = restore_wsl_after_failure_test(canary)
     print(json.dumps(result,indent=2),flush=True)
@@ -1326,7 +1511,7 @@ def uninstall():
     # A WSL-only removal must not contact an unrelated/broken Docker Desktop.
     # Docker cleanup remains available when removing a Docker deployment.
     if selected == 'docker' and Path(DOCKER).is_file():
-        for image in (IMAGE,SOCKS_IMAGE):
+        for image in image_references().values():
             docker('image','rm',image,check=False)
     profile=host.browser_root()
     browser_profiles = [profile, profile.with_name(profile.name + '-Firefox')]

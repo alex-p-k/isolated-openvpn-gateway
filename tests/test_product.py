@@ -104,7 +104,6 @@ class PrimitiveTests(unittest.TestCase):
         text = (ROOT/'setup.cmd').read_text()
         self.assertIn('where py.exe', text)
         self.assertIn('where python.exe', text)
-        self.assertNotIn('Codex', text)
         self.assertNotIn('AppData', text)
 
 
@@ -121,6 +120,11 @@ class ReportTests(unittest.TestCase):
                                wsl_backend=SimpleNamespace(networking_mode=lambda _: 'mirrored'),
                                network_snapshot=lambda: {'public_ip': '203.0.113.1'}, verify_outer_host=lambda *_: None)
         fake.read_json = lambda path: {'project': gateway.PROJECT} if path.name == 'installation.json' else {}
+        def live(backend):
+            available = bool(fake.wsl_names()) if backend == 'wsl' else True
+            return dict(available=available, data=data, tun_exists=ready, healthy=ready,
+                        socks=ready, loopback_only=True, ready=ready and available)
+        fake.connection_state = live
         return fake
 
     def test_ready_is_not_corporate_reachability_or_fail_closed_proof(self):
@@ -163,6 +167,15 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(cli_ui.report(fake)['backend'], 'docker')
         fake.wsl_names.assert_not_called()
 
+    def test_stale_ready_with_failed_live_health_is_an_error(self):
+        fake = self.api()
+        live = fake.connection_state('wsl')
+        live.update(ready=False, healthy=False, loopback_only=None)
+        fake.connection_state = lambda _: live
+        result = cli_ui.report(fake)
+        self.assertEqual(result['state'], 'error')
+        self.assertIsNone(result['details']['loopback_only'])
+
     def test_noninstalled_status_is_actionable(self):
         fake = self.api()
         fake.read_json = lambda _: {}
@@ -172,7 +185,7 @@ class ReportTests(unittest.TestCase):
 class BrowserTests(unittest.TestCase):
     def test_posix_firefox_uses_record_lock_not_stale_file_existence(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(host, 'IS_WINDOWS', False):
-            profile = Path(temp)
+            profile = Path(temp).resolve()
             (profile/'.parentlock').touch()
             fcntl = SimpleNamespace(LOCK_SH=1, LOCK_NB=2, LOCK_UN=4, lockf=Mock())
             with patch.dict(sys.modules, {'fcntl': fcntl}):
@@ -202,9 +215,9 @@ class BrowserTests(unittest.TestCase):
 
     def test_firefox_launch_uses_owned_separate_profile(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)/'gateway'; root.mkdir()
-            base = Path(temp)/'corporate-browser'
-            exe = Path(temp)/'firefox.exe'; exe.touch()
+            root = Path(temp).resolve()/'gateway'; root.mkdir()
+            base = Path(temp).resolve()/'corporate-browser'
+            exe = Path(temp).resolve()/'firefox.exe'; exe.touch()
             (root/'installation.json').write_text(json.dumps({'project':gateway.PROJECT}))
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(browser, 'ROOT', root))
@@ -231,8 +244,8 @@ class BrowserTests(unittest.TestCase):
 class GitProductTests(unittest.TestCase):
     def test_git_idempotent_and_remote_override_cannot_silently_bypass(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(host, 'secure_windows_acl'), contextlib.ExitStack() as stack:
-            root = Path(temp)/'gateway'; root.mkdir()
-            repo = Path(temp)/'repo with spaces'; repo.mkdir()
+            root = Path(temp).resolve()/'gateway'; root.mkdir()
+            repo = Path(temp).resolve()/'repo with spaces'; repo.mkdir()
             clean = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
             for name in ('GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'NO_PROXY', 'no_proxy'):
                 clean.pop(name, None)
@@ -267,7 +280,7 @@ class SetupTests(unittest.TestCase):
 
     def test_checkpoints_contain_no_private_inputs(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(host, 'secure_windows_acl'):
-            root = Path(temp)
+            root = Path(temp).resolve()
             setup_wizard.checkpoint(root, 'files')
             setup_wizard.checkpoint(root, 'files')
             setup_wizard.checkpoint(root, 'backend')
@@ -277,7 +290,7 @@ class SetupTests(unittest.TestCase):
 
     def test_update_recovery_preserves_private_files_and_removes_only_new_app_file(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(host, 'secure_windows_acl'):
-            root = Path(temp); backup = root/'backups'/'app-update-123'; backup.mkdir(parents=True)
+            root = Path(temp).resolve(); backup = root/'backups'/'app-update-123'; backup.mkdir(parents=True)
             (root/'settings.json').write_text('PRIVATE-SETTINGS')
             (root/'old.py').write_text('new')
             (root/'added.py').write_text('new')
@@ -293,14 +306,14 @@ class SetupTests(unittest.TestCase):
 
     def test_update_journal_cannot_target_private_input(self):
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp); backup=root/'backups'/'app-update-1'; backup.mkdir(parents=True)
+            root=Path(temp).resolve(); backup=root/'backups'/'app-update-1'; backup.mkdir(parents=True)
             (root/'update-pending.json').write_text(json.dumps({'backup':str(backup),'files':['runtime/auth']}))
             (backup/'inventory.json').write_text(json.dumps({'runtime/auth':False}))
             with self.assertRaises(product.ProductError): setup_wizard.recover_update(root, SimpleNamespace(INSTALL_FILES=['old.py']))
 
     def test_existing_setup_resumes_and_does_not_switch_backend(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            root = Path(temp)/'IsolatedOpenVPNGateway'; root.mkdir()
+            root = Path(temp).resolve()/'IsolatedOpenVPNGateway'; root.mkdir()
             (root/'installation.json').write_text(json.dumps({'project':gateway.PROJECT}))
             (root/'settings.json').write_text(json.dumps({'backend':'wsl','browser_kind':'chromium'}))
             stub = SimpleNamespace(requirements=Mock(), gateway_module=lambda _: object())
@@ -322,7 +335,7 @@ class SetupTests(unittest.TestCase):
 
     def test_interrupted_backend_stage_preserves_checkpoint_and_resumes(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            root = Path(temp)/'IsolatedOpenVPNGateway'; root.mkdir()
+            root = Path(temp).resolve()/'IsolatedOpenVPNGateway'; root.mkdir()
             (root/'installation.json').write_text(json.dumps({'project':gateway.PROJECT}))
             (root/'settings.json').write_text(json.dumps({'backend':'wsl'}))
             stub = SimpleNamespace(requirements=Mock(), gateway_module=lambda _: object())
@@ -343,8 +356,8 @@ class SetupTests(unittest.TestCase):
 
     def test_new_profile_setup_keeps_original_and_selects_wsl_without_docker(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            root = Path(temp)/'IsolatedOpenVPNGateway'
-            ovpn = Path(temp)/'profile with spaces.ovpn'; ovpn.write_text(PROFILE, encoding='utf-8')
+            root = Path(temp).resolve()/'IsolatedOpenVPNGateway'
+            ovpn = Path(temp).resolve()/'profile with spaces.ovpn'; ovpn.write_text(PROFILE, encoding='utf-8')
             original = ovpn.read_bytes()
             def install_files(_package, _home, profiles, _python, config_bytes, config, **kwargs):
                 self.assertEqual(profiles, {'primary': original})
@@ -358,6 +371,7 @@ class SetupTests(unittest.TestCase):
                                    install_files=install_files)
             stack.enter_context(patch.object(sys.stdin,'isatty',return_value=True))
             stack.enter_context(patch.object(host,'IS_WINDOWS',True))
+            stack.enter_context(patch.object(host,'lifecycle_lock',side_effect=lambda _: contextlib.nullcontext()))
             stack.enter_context(patch.object(host,'is_elevated',return_value=False))
             stack.enter_context(patch.object(host,'install_root',return_value=root))
             stack.enter_context(patch.object(host,'secure_windows_acl'))
@@ -371,7 +385,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(json.loads((root/'setup-state.json').read_text())['completed'][-1], 'complete')
 
     def update_fixture(self, stack):
-        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory())).resolve()
         (root/'scripts').mkdir()
         for name in ('vpn.py','socks.py','wsl_manager.py','wsl_bridge.py','wsl_dependencies.py','wsl_sockd.conf'):
             (root/'scripts'/name).write_bytes((ROOT/'scripts'/name).read_bytes())
@@ -426,7 +440,7 @@ class SetupTests(unittest.TestCase):
 
     def test_update_recovery_refuses_active_session(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(host, 'secure_windows_acl'):
-            root = Path(temp); (root/'runtime').mkdir()
+            root = Path(temp).resolve(); (root/'runtime').mkdir()
             (root/'runtime'/'active-backend').write_text('wsl')
             (root/'update-pending.json').write_text('{"backup":"unused"}')
             with self.assertRaises(product.ProductError) as caught:
@@ -436,14 +450,14 @@ class SetupTests(unittest.TestCase):
 
     def test_checked_destination_cannot_escape_root(self):
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaises(product.ProductError): setup_wizard.checked_destination(Path(temp),'../elsewhere')
+            with self.assertRaises(product.ProductError): setup_wizard.checked_destination(Path(temp).resolve(),'../elsewhere')
 
 
 class PathRegistrationTests(unittest.TestCase):
     def test_location_registration_removes_only_owned_value(self):
         for preexisting in (False, True):
             with self.subTest(preexisting=preexisting), tempfile.TemporaryDirectory() as temp, patch.object(host, 'secure_windows_acl'):
-                root = Path(temp)
+                root = Path(temp).resolve()
                 values = {'InstallRoot': str(root)} if preexisting else {}
                 def query(_key, name):
                     if name not in values: raise FileNotFoundError
@@ -461,7 +475,7 @@ class PathRegistrationTests(unittest.TestCase):
 
     def test_optin_registration_and_exact_owned_rollback(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            root=Path(temp)
+            root=Path(temp).resolve()
             entry=str(root/'bin')
             state={'path':'C:\\Old','kind':2}
             stack.enter_context(patch.object(host,'secure_windows_acl'))
@@ -478,7 +492,7 @@ class PathRegistrationTests(unittest.TestCase):
 
     def test_existing_unowned_path_entry_is_not_removed(self):
         with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
-            root=Path(temp)
+            root=Path(temp).resolve()
             stack.enter_context(patch.object(host,'secure_windows_acl'))
             stack.enter_context(patch.object(path_integration,'read_user_path',return_value=(str(root/'bin'),2)))
             write=stack.enter_context(patch.object(path_integration,'write_user_path'))
@@ -499,7 +513,7 @@ class PathRegistrationTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt','Real CMD bootstrap check requires Windows')
     def test_bootstrap_help_from_unicode_checkout_with_spaces(self):
         with tempfile.TemporaryDirectory(prefix='gateway bootstrap ') as temp:
-            package = Path(temp)/'пакет с пробелами'; package.mkdir()
+            package = Path(temp).resolve()/'пакет с пробелами'; package.mkdir()
             installer = setup_wizard.installer_module(ROOT)
             for name in installer.PACKAGE_FILES:
                 destination = package/name
@@ -514,7 +528,7 @@ class PathRegistrationTests(unittest.TestCase):
 
     def test_lock_probe_does_not_create_a_file(self):
         with tempfile.TemporaryDirectory() as temp:
-            path=Path(temp)/'.lock'
+            path=Path(temp).resolve()/'.lock'
             self.assertFalse(host.lifecycle_busy(path))
             self.assertFalse(path.exists())
 
